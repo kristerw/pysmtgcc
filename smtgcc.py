@@ -1,0 +1,1527 @@
+import gcc
+from z3 import *
+
+
+# Solver memory limit (in megabytes) or 0 for "no limit".
+SOLVER_MAX_MEMORY = 25 * 1024
+
+# Solver timeout (in seconds) or 0 for "no limit".
+SOLVER_TIMEOUT = 5 * 60
+
+# Size of anonymous memory size blocks we may need to introduce (for example,
+# so that function pointer arguments have memory to point to).
+ANON_MEM_SIZE = 64
+
+# How many bytes load, store, __builtin_memset, etc. can expand.
+MAX_MEMORY_UNROLL_LIMIT = 10000
+
+# How the pointer bits are divided between id and offset.
+PTR_OFFSET_BITS = 40
+PTR_ID_BITS = 24
+assert PTR_ID_BITS + PTR_OFFSET_BITS == 64
+
+
+class NotImplementedError(Exception):
+    """Raised when encountering unimplemented constructs."""
+
+    def __init__(self, string, location=None):
+        self.location = location
+        Exception.__init__(self, string)
+
+
+class Error(Exception):
+    """Raised when being passed incorrect input, etc."""
+
+    def __init__(self, string, location=None):
+        self.location = location
+        Exception.__init__(self, string)
+
+
+class CommonState:
+    """Things that are common for the source and target functions."""
+
+    def __init__(
+        self,
+        global_memory,
+        next_id,
+        ptr_constraints,
+        mem_objects,
+        mem_sizes,
+        fun_args,
+    ):
+        self.global_memory = global_memory
+        self.local_memory = None
+        self.next_id = next_id
+        self.ptr_constraints = ptr_constraints
+        self.mem_objects = mem_objects
+        self.mem_sizes = mem_sizes
+        self.decl_to_memory = {}
+        self.fun_args = fun_args
+        self.retval = None
+
+
+class MemoryBlock:
+    def __init__(self, decl, size, mem_id):
+        if size > (1 << PTR_OFFSET_BITS):
+            if decl is not None:
+                location = decl.location
+            else:
+                location = None
+            raise NotImplementedError("Too big memory block", location)
+        self.size = size
+        self.decl = decl
+        self.mem_id = mem_id
+        name = ".mem_" + str(self.mem_id)
+        self.mem_array = Array(name, BitVecSort(PTR_OFFSET_BITS), BitVecSort(8))
+
+
+class SmtPointer:
+    def __init__(self, mem_id, offset):
+        assert mem_id.sort() == BitVecSort(PTR_ID_BITS)
+        assert offset.sort() == BitVecSort(PTR_OFFSET_BITS)
+        self.mem_id = mem_id
+        self.offset = offset
+
+    def bitvector(self):
+        return Concat([self.mem_id, self.offset])
+
+
+class SmtFunction:
+    def __init__(self, fun, state):
+        self.fun = fun
+        self.name = fun.decl.name
+        self.tree_to_smt = {}
+        self.decl_to_id = {}
+        self.bb2smt = {}
+        self.state = state
+
+        # Function return
+        self.retval = None
+        self.invokes_ub = None
+        self.mem_objects = None
+        self.mem_sizes = None
+
+    def add_ub(self, smt):
+        if self.invokes_ub is None:
+            self.invokes_ub = smt
+        else:
+            self.invokes_ub = Or(self.invokes_ub, smt)
+
+
+class SmtBB:
+    def __init__(self, bb, smt_fun, mem_objects, mem_sizes):
+        self.bb = bb
+        self.smt_fun = smt_fun
+        self.invokes_ub = None
+        self.smtcond = None
+        self.retval = None
+        self.labels = self._find_labels()
+        self.switch_stmt = None
+        smt_fun.bb2smt[bb] = self
+
+        if len(bb.preds) == 0:
+            self.smt_mem_objects = mem_objects
+            self.smt_mem_sizes = mem_sizes
+        else:
+            mem_objects = []
+            mem_sizes = []
+            for edge in bb.preds:
+                src_smt_bb = smt_fun.bb2smt[edge.src]
+                objects = src_smt_bb.smt_mem_objects
+                mem_objects.append((objects, edge))
+                sizes = src_smt_bb.smt_mem_sizes
+                mem_sizes.append((sizes, edge))
+            self.smt_mem_objects = process_phi_smt_args(mem_objects, smt_fun)
+            self.smt_mem_sizes = process_phi_smt_args(mem_sizes, smt_fun)
+
+        # Create condition telling if this BB is executed or not.
+        if len(bb.preds) == 0:
+            # The entry block is always executed.
+            self.is_executed = BoolVal(True)
+        else:
+            # The block is executed if any of the edges are executed.
+            is_executed = None
+            for edge in bb.preds:
+                cond = build_full_edge_cond(edge, smt_fun)
+                if is_executed is None:
+                    is_executed = cond
+                else:
+                    is_executed = Or(is_executed, cond)
+            self.is_executed = is_executed
+
+    def _find_labels(self):
+        labels = []
+        for stmt in self.bb.gimple:
+            if isinstance(stmt, gcc.GimpleLabel):
+                labels.append(stmt.label)
+        return labels
+
+    def add_ub(self, smt):
+        if self.invokes_ub is None:
+            self.invokes_ub = smt
+        else:
+            self.invokes_ub = Or(self.invokes_ub, smt)
+
+
+def build_switch_cond(stmt, label, smt_bb):
+    "Build SMT condition corresponding to the case(s) jumping to the label."
+    assert isinstance(stmt, gcc.GimpleSwitch)
+    assert isinstance(stmt.indexvar.type, gcc.IntegerType)
+    target_cond = None
+    default_cond = None
+    indexvar = get_tree_as_smt(stmt.indexvar, smt_bb)
+    for expr in stmt.labels[1:]:
+        low = get_tree_as_smt(expr.low, smt_bb)
+
+        # The case type may be of a lower precision. If so, extend it.
+        if stmt.indexvar.type.precision > expr.low.type.precision:
+            extbits = stmt.indexvar.type.precision - expr.low.type.precision
+            if expr.low.type.unsigned:
+                low = ZeroExt(extbits, low)
+            else:
+                low = SignExt(extbits, low)
+
+        if expr.high is not None:
+            high = get_tree_as_smt(expr.high, smt_bb)
+            if stmt.indexvar.type.precision > expr.high.type.precision:
+                extbits = stmt.indexvar.type.precision - expr.high.type.precision
+                if expr.high.type.unsigned:
+                    high = ZeroExt(extbits, high)
+                else:
+                    high = SignExt(extbits, high)
+
+            if stmt.indexvar.type.unsigned:
+                low_cond = ULE(low, indexvar)
+                high_cond = ULE(indexvar, high)
+            else:
+                low_cond = low <= indexvar
+                high_cond = indexvar <= high
+            cond = And(low_cond, high_cond)
+        else:
+            cond = indexvar == low
+
+        if expr.target == label:
+            if target_cond is None:
+                target_cond = cond
+            else:
+                target_cond = Or(target_cond, cond)
+        if default_cond is None:
+            default_cond = Not(cond)
+        else:
+            default_cond = And(default_cond, Not(cond))
+
+    if stmt.labels[0].target == label:
+        if target_cond is not None:
+            return Or(target_cond, default_cond)
+        return default_cond
+    return target_cond
+
+
+def get_smt_sort(type):
+    """Return the SMT sort for the GCC type."""
+    if isinstance(type, gcc.IntegerType):
+        return BitVecSort(type.precision)
+    if isinstance(type, gcc.BooleanType):
+        return BoolSort()
+    if isinstance(type, gcc.RealType):
+        if type.precision == 16:
+            return Float16()
+        if type.precision == 32:
+            return Float32()
+        if type.precision == 64:
+            return Float64()
+        if type.precision == 80:
+            # 80-bit floats does not follow the IEEE standard, so this is
+            # "wrong". But GCC does not do any optimizations on GIMPLE that
+            # depend on the properties that differ, so this is OK for now.
+            return FPSort(15, 64)
+        if type.precision == 128:
+            return Float128()
+
+    raise NotImplementedError(f"get_smt_sort {type.__class__}")
+
+
+def load_bytes(mem_id, offset, size, smt_bb):
+    assert size > 0
+    if size > MAX_MEMORY_UNROLL_LIMIT:
+        raise NotImplementedError(f"load_bytes too big ({size})")
+
+    # Load the "byte" values from the memory object.
+    bytes = []
+    array = Select(smt_bb.smt_mem_objects, mem_id)
+    is_constant_offset = is_bv_value(offset)
+    for i in range(0, size):
+        off = offset + i
+        if is_constant_offset:
+            off = simplify(off)
+        byte_value = Select(array, off)
+        bytes.insert(0, byte_value)
+
+    # Add UB checks for out of bounds access.
+    smt_bb.add_ub(UGE(mem_id, smt_bb.smt_fun.state.next_id))
+    smt_size = Select(smt_bb.smt_mem_sizes, mem_id)
+    smt_bb.add_ub(UGT(offset + size, smt_size))
+    smt_bb.add_ub(UGE(offset, offset + size))
+
+    # Construct a bit-vector for the loaded value.
+    if size == 1:
+        result = bytes[0]
+    else:
+        result = Concat(bytes)
+
+    return result
+
+
+def load(expr, smt_bb):
+    mem_id, offset = build_smt_addr(expr, smt_bb)
+    result = load_bytes(mem_id, offset, expr.type.sizeof, smt_bb)
+
+    # Convert the bit-vector to the correct type.
+    if isinstance(expr.type, gcc.RealType):
+        if expr.type.precision == 80:
+            result = Extract(78, 0, result)
+        result = fpBVToFP(result, get_smt_sort(expr.type))
+    elif isinstance(expr.type, gcc.BooleanType):
+        result = result != 0
+    elif isinstance(expr.type, gcc.PointerType):
+        mem_id = Extract(63, PTR_OFFSET_BITS, result)
+        offset = Extract(PTR_OFFSET_BITS - 1, 0, result)
+        result = SmtPointer(mem_id, offset)
+    elif not isinstance(expr.type, gcc.IntegerType):
+        raise NotImplementedError("load " + str(expr.type.__class__))
+
+    return result
+
+
+def load_bitfield(expr, smt_bb):
+    assert is_bitfield(expr)
+    size = (expr.bitoffset + expr.type.precision + 7) // 8
+    mem_id, offset = build_smt_addr(expr, smt_bb)
+    bytes = load_bytes(mem_id, offset, size, smt_bb)
+    return Extract(expr.bitoffset + expr.type.precision - 1, expr.bitoffset, bytes)
+
+
+def store_bytes(mem_id, offset, size, value, smt_bb):
+    assert size > 0
+    if size > MAX_MEMORY_UNROLL_LIMIT:
+        raise NotImplementedError(f"store_bytes too big ({size})")
+
+    # Write the value to the memory object.
+    array = Select(smt_bb.smt_mem_objects, mem_id)
+    is_constant_offset = is_bv_value(offset)
+    for i in range(0, size):
+        byte_value = Extract(i * 8 + 7, i * 8, value)
+        off = offset + i
+        if is_constant_offset:
+            off = simplify(off)
+        array = Store(array, off, byte_value)
+
+    # Add UB checks for out of bounds access.
+    smt_bb.add_ub(UGE(mem_id, smt_bb.smt_fun.state.next_id))
+    smt_size = Select(smt_bb.smt_mem_sizes, mem_id)
+    smt_bb.add_ub(UGT(offset + size, smt_size))
+    smt_bb.add_ub(UGE(offset, offset + size))
+
+    # Update the array of memory objects.
+    smt_bb.smt_mem_objects = Store(smt_bb.smt_mem_objects, mem_id, array)
+
+
+def store(stmt, value, smt_bb):
+    # Create a bit-vector for the value to store.
+    type = stmt.lhs.type
+    if isinstance(type, gcc.RealType):
+        value = fpToIEEEBV(value)
+        if type.precision == 80:
+            value = Concat([BitVecVal(0, 49), value])
+    elif isinstance(type, gcc.BooleanType):
+        bv0 = BitVecVal(0, 8)
+        bv1 = BitVecVal(1, 8)
+        value = If(value, bv1, bv0)
+    elif isinstance(type, gcc.PointerType):
+        value = value.bitvector()
+    elif not isinstance(type, gcc.IntegerType):
+        raise NotImplementedError("store " + str(type.__class__))
+
+    mem_id, offset = build_smt_addr(stmt.lhs, smt_bb)
+    store_bytes(mem_id, offset, type.sizeof, value, smt_bb)
+
+
+def store_bitfield(expr, value, smt_bb):
+    assert is_bitfield(expr)
+    mem_id, offset = build_smt_addr(expr, smt_bb)
+
+    size = (expr.bitoffset + expr.type.precision + 7) // 8
+    result = load_bytes(mem_id, offset, size, smt_bb)
+    parts = []
+    if expr.bitoffset + expr.type.precision != size * 8:
+        nof_bits = size * 8
+        parts.append(
+            Extract(nof_bits - 1, expr.bitoffset + expr.type.precision, result)
+        )
+    parts.append(value)
+    if expr.bitoffset != 0:
+        parts.append(Extract(expr.bitoffset - 1, 0, result))
+    if len(parts) == 1:
+        value = parts[0]
+    else:
+        value = Concat(parts)
+
+    store_bytes(mem_id, offset, size, value, smt_bb)
+
+
+def has_loop(fun):
+    "Does the function contain a loop?"
+    seen_bbs = []
+    for bb in fun.cfg.inverted_post_order:
+        seen_bbs.append(bb)
+        for succ in bb.succs:
+            if succ.dest in seen_bbs:
+                return True
+    return False
+
+
+def uninit_var_to_smt(expr):
+    "Build a Const representing read from an uninitialized variable."
+    # Variables generated by the compiler gets None as expr.var.name.
+    # So generate the Const name by using str(expr.var) instead.
+    name = f".undef.{expr.var}"
+    if isinstance(expr.type, gcc.PointerType):
+        ptr = Const(name, BitVecSort(64))
+        mem_id = Extract(63, PTR_OFFSET_BITS, ptr)
+        offset = Extract(PTR_OFFSET_BITS - 1, 0, ptr)
+        return SmtPointer(mem_id, offset)
+    return Const(name, get_smt_sort(expr.type))
+
+
+def get_tree_as_smt(expr, smt_bb):
+    if isinstance(expr, gcc.ParmDecl):
+        return smt_bb.smt_fun.tree_to_smt[expr]
+    if isinstance(expr, gcc.SsaName):
+        if expr in smt_bb.smt_fun.tree_to_smt:
+            return smt_bb.smt_fun.tree_to_smt[expr]
+        if isinstance(expr.var, gcc.ParmDecl):
+            return smt_bb.smt_fun.tree_to_smt[expr.var]
+        if isinstance(expr.var, gcc.VarDecl):
+            # We are reading from an uninitialized local variable.
+            # Make execution of this BB as UB, and create a new
+            # unconstrained constant to make the generated SMT
+            # typecheck.
+            smt_bb.add_ub(BoolVal(True))
+            return uninit_var_to_smt(expr)
+        raise NotImplementedError(f"get_tree_as_smt SsaName {expr}")
+    if isinstance(expr, gcc.IntegerCst):
+        if isinstance(expr.type, gcc.BooleanType):
+            return BoolVal(expr.constant != 0)
+        if isinstance(expr.type, gcc.IntegerType):
+            return BitVecVal(expr.constant, expr.type.precision)
+        if isinstance(expr.type, gcc.PointerType):
+            cst = BitVecVal(expr.constant, 64)
+            mem_id = Extract(63, PTR_OFFSET_BITS, cst)
+            offset = Extract(PTR_OFFSET_BITS - 1, 0, cst)
+            return SmtPointer(mem_id, offset)
+    if isinstance(expr, gcc.ViewConvertExpr):
+        value = get_tree_as_smt(expr.operand, smt_bb)
+        return bit_cast(value, expr.operand.type, expr.type)
+    if isinstance(expr, gcc.RealCst):
+        return FPVal(expr.constant, get_smt_sort(expr.type))
+    if isinstance(expr, gcc.AddrExpr):
+        mem_id, offset = build_smt_addr(expr.operand, smt_bb)
+        return SmtPointer(mem_id, offset)
+    if isinstance(expr, (gcc.VarDecl, gcc.ArrayRef, gcc.ComponentRef, gcc.MemRef)):
+        if is_bitfield(expr):
+            return load_bitfield(expr, smt_bb)
+        return load(expr, smt_bb)
+
+    raise NotImplementedError(f"get_tree_as_smt {expr.__class__} {expr.type.__class__}")
+
+
+def is_bitfield(expr):
+    "Return true if expr is a gcc.ComponentRef for a bitfield."
+    if not isinstance(expr, gcc.ComponentRef):
+        return False
+    if not isinstance(expr.type, gcc.IntegerType):
+        return False
+    if expr.bitoffset % 8 != 0:
+        return True
+    # If a bit field with a size that is a multiple of a byte, and the field
+    # is byte aligned, then we can treat it as a normal load/store.
+    return expr.type.precision != expr.type.sizeof * 8
+
+
+def process_comparison(stmt, smt_bb):
+    if isinstance(stmt, gcc.GimpleCond):
+        type = stmt.lhs.type
+        rhs0 = get_tree_as_smt(stmt.lhs, smt_bb)
+        rhs1 = get_tree_as_smt(stmt.rhs, smt_bb)
+    else:
+        assert isinstance(stmt, gcc.GimpleAssign)
+        type = stmt.rhs[0].type
+        rhs0 = get_tree_as_smt(stmt.rhs[0], smt_bb)
+        rhs1 = get_tree_as_smt(stmt.rhs[1], smt_bb)
+    if isinstance(type, gcc.IntegerType):
+        is_unsigned = type.unsigned
+    elif isinstance(type, gcc.RealType):
+        pass
+    elif isinstance(type, gcc.BooleanType):
+        if stmt.exprcode not in [gcc.EqExpr, gcc.NeExpr]:
+            # The SMT solver API does not handle <, <=, >, >= for Boolean
+            # values, so we convert them to bit-vectors.
+            is_unsigned = True
+            one = BitVecVal(1, 1)
+            zero = BitVecVal(0, 1)
+            rhs0 = If(rhs0, one, zero)
+            rhs1 = If(rhs1, one, zero)
+    elif isinstance(type, gcc.PointerType):
+        is_unsigned = True
+        rhs0 = rhs0.bitvector()
+        rhs1 = rhs1.bitvector()
+    else:
+        raise NotImplementedError(f"process_comparison {type.__class__}", stmt.loc)
+
+    if isinstance(type, gcc.RealType):
+        if stmt.exprcode == gcc.LtExpr:
+            return fpLT(rhs0, rhs1)
+        if stmt.exprcode == gcc.LeExpr:
+            return fpLEQ(rhs0, rhs1)
+        if stmt.exprcode == gcc.GtExpr:
+            return fpGT(rhs0, rhs1)
+        if stmt.exprcode == gcc.GeExpr:
+            return fpGEQ(rhs0, rhs1)
+        if stmt.exprcode == gcc.EqExpr:
+            return fpEQ(rhs0, rhs1)
+        if stmt.exprcode == gcc.NeExpr:
+            return fpNEQ(rhs0, rhs1)
+        if stmt.exprcode == gcc.UneqExpr:
+            return Or(Or(fpIsNaN(rhs0), fpIsNaN(rhs1)), fpEQ(rhs0, rhs1))
+        if stmt.exprcode == gcc.UnltExpr:
+            return Or(Or(fpIsNaN(rhs0), fpIsNaN(rhs1)), fpLT(rhs0, rhs1))
+        if stmt.exprcode == gcc.UnleExpr:
+            return Or(Or(fpIsNaN(rhs0), fpIsNaN(rhs1)), fpLEQ(rhs0, rhs1))
+        if stmt.exprcode == gcc.UngtExpr:
+            return Or(Or(fpIsNaN(rhs0), fpIsNaN(rhs1)), fpGT(rhs0, rhs1))
+        if stmt.exprcode == gcc.UngeExpr:
+            return Or(Or(fpIsNaN(rhs0), fpIsNaN(rhs1)), fpGEQ(rhs0, rhs1))
+        if stmt.exprcode == gcc.UnorderedExpr:
+            return Or(fpIsNaN(rhs0), fpIsNaN(rhs1))
+        if stmt.exprcode == gcc.OrderedExpr:
+            return Not(Or(fpIsNaN(rhs0), fpIsNaN(rhs1)))
+    else:
+        if stmt.exprcode == gcc.LtExpr:
+            if is_unsigned:
+                return ULT(rhs0, rhs1)
+            return rhs0 < rhs1
+        if stmt.exprcode == gcc.LeExpr:
+            if is_unsigned:
+                return ULE(rhs0, rhs1)
+            return rhs0 <= rhs1
+        if stmt.exprcode == gcc.GtExpr:
+            if is_unsigned:
+                return UGT(rhs0, rhs1)
+            return rhs0 > rhs1
+        if stmt.exprcode == gcc.GeExpr:
+            if is_unsigned:
+                return UGE(rhs0, rhs1)
+            return rhs0 >= rhs1
+        if stmt.exprcode == gcc.EqExpr:
+            return rhs0 == rhs1
+        if stmt.exprcode == gcc.NeExpr:
+            return rhs0 != rhs1
+
+    raise NotImplementedError(f"process_comparison {stmt.exprcode}", stmt.loc)
+
+
+def process_integer_binary(stmt, smt_bb):
+    assert len(stmt.rhs) == 2
+
+    type = stmt.lhs.type
+    rhs0 = get_tree_as_smt(stmt.rhs[0], smt_bb)
+    rhs1 = get_tree_as_smt(stmt.rhs[1], smt_bb)
+    if stmt.exprcode == gcc.PlusExpr:
+        res = rhs0 + rhs1
+        if not type.overflow_wraps:
+            erhs0 = SignExt(1, rhs0)
+            erhs1 = SignExt(1, rhs1)
+            eres = erhs0 + erhs1
+            smt_bb.add_ub(SignExt(1, res) != eres)
+        return res
+    if stmt.exprcode == gcc.MinusExpr:
+        res = rhs0 - rhs1
+        if not type.overflow_wraps:
+            erhs0 = SignExt(1, rhs0)
+            erhs1 = SignExt(1, rhs1)
+            eres = erhs0 - erhs1
+            smt_bb.add_ub(SignExt(1, res) != eres)
+        return res
+    if stmt.exprcode == gcc.MultExpr:
+        res = rhs0 * rhs1
+        if not type.overflow_wraps:
+            erhs0 = SignExt(type.precision, rhs0)
+            erhs1 = SignExt(type.precision, rhs1)
+            eres = erhs0 * erhs1
+            smt_bb.add_ub(SignExt(type.precision, res) != eres)
+        return res
+    if stmt.exprcode == gcc.WidenMultExpr:
+        if stmt.rhs[0].type.unsigned:
+            rhs0 = ZeroExt(stmt.rhs[0].type.precision, rhs0)
+        else:
+            rhs0 = SignExt(stmt.rhs[0].type.precision, rhs0)
+        if stmt.rhs[1].type.unsigned:
+            rhs1 = ZeroExt(stmt.rhs[1].type.precision, rhs1)
+        else:
+            rhs1 = SignExt(stmt.rhs[1].type.precision, rhs1)
+        return rhs0 * rhs1
+    if stmt.exprcode == gcc.MultHighpartExpr:
+        precision = stmt.rhs[0].type.precision
+        if stmt.rhs[0].type.unsigned:
+            rhs0 = ZeroExt(precision, rhs0)
+        else:
+            rhs0 = SignExt(precision, rhs0)
+        if stmt.rhs[1].type.unsigned:
+            rhs1 = ZeroExt(precision, rhs1)
+        else:
+            rhs1 = SignExt(precision, rhs1)
+        result = rhs0 * rhs1
+        return Extract(2 * precision - 1, precision, result)
+    if stmt.exprcode == gcc.TruncDivExpr:
+        if type.unsigned:
+            res = UDiv(rhs0, rhs1)
+        else:
+            res = rhs0 / rhs1
+            if not type.overflow_wraps:
+                ub = And(rhs0 == type.min_value.constant, rhs1 == -1)
+                smt_bb.add_ub(ub)
+        smt_bb.add_ub(rhs1 == 0)
+        return res
+    if stmt.exprcode == gcc.ExactDivExpr:
+        if type.unsigned:
+            res = UDiv(rhs0, rhs1)
+        else:
+            res = rhs0 / rhs1
+            if not type.overflow_wraps:
+                ub = And(rhs0 == type.min_value.constant, rhs1 == -1)
+                smt_bb.add_ub(ub)
+            if type.unsigned:
+                smt_bb.add_ub(URem(rhs0, rhs1) != 0)
+            else:
+                smt_bb.add_ub(SRem(rhs0, rhs1) != 0)
+        smt_bb.add_ub(rhs1 == 0)
+        return res
+    if stmt.exprcode == gcc.TruncModExpr:
+        if type.unsigned:
+            res = URem(rhs0, rhs1)
+        else:
+            res = SRem(rhs0, rhs1)
+            if not type.overflow_wraps:
+                smt_bb.add_ub(And(rhs0 == type.min_value.constant, rhs1 == -1))
+        smt_bb.add_ub(rhs1 == 0)
+        return res
+    if stmt.exprcode == gcc.BitIorExpr:
+        return rhs0 | rhs1
+    if stmt.exprcode == gcc.BitAndExpr:
+        return rhs0 & rhs1
+    if stmt.exprcode == gcc.BitXorExpr:
+        return rhs0 ^ rhs1
+    if stmt.exprcode == gcc.LshiftExpr:
+        smt_bb.add_ub(UGE(rhs1, type.precision))
+        if stmt.rhs[0].type.precision != stmt.rhs[1].type.precision:
+            rhs1 = convert_to_integer(rhs1, stmt.rhs[1].type, stmt.rhs[0].type)
+        return rhs0 << rhs1
+    if stmt.exprcode == gcc.RshiftExpr:
+        smt_bb.add_ub(UGE(rhs1, type.precision))
+        if stmt.rhs[0].type.precision != stmt.rhs[1].type.precision:
+            rhs1 = convert_to_integer(rhs1, stmt.rhs[1].type, stmt.rhs[0].type)
+        if type.unsigned:
+            res = LShR(rhs0, rhs1)
+        else:
+            res = rhs0 >> rhs1
+        return res
+    if stmt.exprcode == gcc.MaxExpr:
+        if type.unsigned:
+            cmp = UGE(rhs0, rhs1)
+        else:
+            cmp = rhs0 >= rhs1
+        return If(cmp, rhs0, rhs1)
+    if stmt.exprcode == gcc.MinExpr:
+        if type.unsigned:
+            cmp = ULE(rhs0, rhs1)
+        else:
+            cmp = rhs0 <= rhs1
+        return If(cmp, rhs0, rhs1)
+    if stmt.exprcode == gcc.LrotateExpr:
+        smt_bb.add_ub(UGE(rhs1, type.precision))
+        if stmt.rhs[0].type.precision != stmt.rhs[1].type.precision:
+            rhs1 = convert_to_integer(rhs1, stmt.rhs[1].type, stmt.rhs[0].type)
+        return RotateLeft(rhs0, rhs1)
+    if stmt.exprcode == gcc.RrotateExpr:
+        smt_bb.add_ub(UGE(rhs1, type.precision))
+        if stmt.rhs[0].type.precision != stmt.rhs[1].type.precision:
+            rhs1 = convert_to_integer(rhs1, stmt.rhs[1].type, stmt.rhs[0].type)
+        return RotateRight(rhs0, rhs1)
+    if stmt.exprcode == gcc.PointerDiffExpr:
+        assert type.precision == 64
+        bv0 = rhs0.bitvector()
+        bv1 = rhs1.bitvector()
+        return bv0 - bv1
+
+    raise NotImplementedError(f"process_integer_binary {stmt.exprcode}", stmt.loc)
+
+
+def process_boolean_binary(stmt, smt_bb):
+    assert len(stmt.rhs) == 2
+
+    rhs0 = get_tree_as_smt(stmt.rhs[0], smt_bb)
+    rhs1 = get_tree_as_smt(stmt.rhs[1], smt_bb)
+
+    if stmt.exprcode in [
+        gcc.LtExpr,
+        gcc.LeExpr,
+        gcc.GtExpr,
+        gcc.GeExpr,
+        gcc.EqExpr,
+        gcc.NeExpr,
+        gcc.UneqExpr,
+        gcc.UnltExpr,
+        gcc.UnleExpr,
+        gcc.UngtExpr,
+        gcc.UngeExpr,
+        gcc.UnorderedExpr,
+        gcc.OrderedExpr,
+    ]:
+        return process_comparison(stmt, smt_bb)
+
+    rhs0 = canonicalize_bool(rhs0)
+    rhs1 = canonicalize_bool(rhs1)
+    if stmt.exprcode in (gcc.BitIorExpr, gcc.MaxExpr):
+        return Or(rhs0, rhs1)
+    if stmt.exprcode in (gcc.BitAndExpr, gcc.MinExpr):
+        return And(rhs0, rhs1)
+    if stmt.exprcode == gcc.BitXorExpr:
+        return Xor(rhs0, rhs1)
+
+    raise NotImplementedError(f"process_boolean_binary {stmt.exprcode}", stmt.loc)
+
+
+def process_float_binary(stmt, smt_bb):
+    assert len(stmt.rhs) == 2
+
+    rhs0 = get_tree_as_smt(stmt.rhs[0], smt_bb)
+    rhs1 = get_tree_as_smt(stmt.rhs[1], smt_bb)
+    if stmt.exprcode == gcc.PlusExpr:
+        return rhs0 + rhs1
+    if stmt.exprcode == gcc.MinusExpr:
+        return rhs0 - rhs1
+    if stmt.exprcode == gcc.MultExpr:
+        return rhs0 * rhs1
+    if stmt.exprcode == gcc.RdivExpr:
+        return rhs0 / rhs1
+
+    raise NotImplementedError(f"process_float_binary {stmt.exprcode}", stmt.loc)
+
+
+def process_pointer_binary(stmt, smt_bb):
+    assert len(stmt.rhs) == 2
+
+    rhs0 = get_tree_as_smt(stmt.rhs[0], smt_bb)
+    rhs1 = get_tree_as_smt(stmt.rhs[1], smt_bb)
+    if stmt.exprcode == gcc.PointerPlusExpr:
+        assert rhs1.sort() == BitVecSort(64)
+        # Note: add_to_offset adds the UB check.
+        offset = add_to_offset(rhs0.offset, rhs1, smt_bb)
+        return SmtPointer(rhs0.mem_id, offset)
+    if stmt.exprcode == gcc.MinExpr:
+        bv0 = rhs0.bitvector()
+        bv1 = rhs1.bitvector()
+        return build_if(bv0 < bv1, rhs0, rhs1)
+    if stmt.exprcode == gcc.MaxExpr:
+        bv0 = rhs0.bitvector()
+        bv1 = rhs1.bitvector()
+        return build_if(bv0 >= bv1, rhs0, rhs1)
+    if stmt.exprcode == gcc.BitAndExpr:
+        mem_id = rhs0.mem_id & rhs1.mem_id
+        offset = rhs0.offset & rhs1.offset
+        return SmtPointer(mem_id, offset)
+
+    raise NotImplementedError(f"process_pointer_binary {stmt.exprcode}", stmt.loc)
+
+
+def canonicalize_bool(expr):
+    """Change BitVecSort(1) to BoolSort().
+    Some passes treat <unnamed-unsigned:1> as _Bool, and we may end up with,
+    for example, xor of a  BitVecSort(1) and BoolSort()."""
+    if expr.sort() == BitVecSort(1):
+        return expr != 0
+    assert expr.sort() == BoolSort()
+    return expr
+
+
+def add_to_offset(offset, val, smt_bb):
+    "Add a 64bit value to a pointer offset, and report UB on overflow."
+    assert offset.sort() == BitVecSort(PTR_OFFSET_BITS)
+    assert val.sort() == BitVecSort(64)
+    is_constant = is_bv_value(offset)
+    offset = ZeroExt(64 - PTR_OFFSET_BITS, offset)
+    offset = offset + val
+    if is_constant:
+        offset = simplify(offset)
+    smt_bb.add_ub(UGE(offset, (1 << PTR_OFFSET_BITS)))
+    offset = Extract(PTR_OFFSET_BITS - 1, 0, offset)
+    if is_constant:
+        offset = simplify(offset)
+    return offset
+
+
+def bit_cast(value, src_type, dest_type):
+    if isinstance(src_type, gcc.RealType):
+        value = fpToIEEEBV(value)
+    elif isinstance(src_type, gcc.PointerType):
+        value = value.bitvector()
+    elif not isinstance(src_type, gcc.IntegerType):
+        raise NotImplementedError(f"bit_cast src_type {src_type.__class__}")
+
+    if isinstance(dest_type, gcc.RealType):
+        return fpBVToFP(value, get_smt_sort(dest_type))
+    if isinstance(dest_type, gcc.PointerType):
+        mem_id = Extract(63, PTR_OFFSET_BITS, value)
+        offset = Extract(PTR_OFFSET_BITS - 1, 0, value)
+        return SmtPointer(mem_id, offset)
+    if isinstance(dest_type, gcc.IntegerType):
+        return value
+
+    raise NotImplementedError(f"bit_cast dest_type {dest_type.__class__}")
+
+
+def convert_to_integer(value, src_type, dest_type):
+    assert isinstance(dest_type, gcc.IntegerType)
+    if isinstance(src_type, gcc.IntegerType):
+        if src_type.precision > dest_type.precision:
+            return Extract(dest_type.precision - 1, 0, value)
+        if src_type.precision < dest_type.precision:
+            extbits = dest_type.precision - src_type.precision
+            if src_type.unsigned:
+                return ZeroExt(extbits, value)
+            return SignExt(extbits, value)
+        return value
+    if isinstance(src_type, gcc.BooleanType):
+        bv0 = BitVecVal(0, dest_type.precision)
+        bv1 = BitVecVal(1, dest_type.precision)
+        return If(value, bv1, bv0)
+    if isinstance(src_type, gcc.PointerType):
+        res = value.bitvector()
+        if dest_type.precision < 64:
+            res = Extract(dest_type.precision - 1, 0, res)
+        elif dest_type.precision > 64:
+            res = ZeroExt(dest_type.precision - 64, res)
+        return res
+
+    raise NotImplementedError(f"convert_to_integer {src_type.__class__}")
+
+
+def convert_to_pointer(value, src_type, dest_type):
+    assert isinstance(dest_type, gcc.PointerType)
+
+    if isinstance(src_type, gcc.BooleanType):
+        mem_id = BitVecVal(0, PTR_ID_BITS)
+        bv0 = BitVecVal(0, PTR_OFFSET_BITS)
+        bv1 = BitVecVal(1, PTR_OFFSET_BITS)
+        offset = If(value, bv1, bv0)
+        return SmtPointer(mem_id, offset)
+    if isinstance(src_type, gcc.IntegerType):
+        if src_type.precision < 64:
+            extbits = 64 - src_type.precision
+            if src_type.unsigned:
+                value = ZeroExt(extbits, value)
+            else:
+                value = SignExt(extbits, value)
+        mem_id = Extract(63, PTR_OFFSET_BITS, value)
+        offset = Extract(PTR_OFFSET_BITS - 1, 0, value)
+        return SmtPointer(mem_id, offset)
+    if isinstance(src_type, gcc.PointerType):
+        return value
+
+    raise NotImplementedError(f"convert_to_pointer {src_type.__class__}")
+
+
+def convert_to_boolean(value, src_type):
+    if isinstance(src_type, gcc.IntegerType):
+        return (value & 1) != 0
+
+    raise NotImplementedError(f"convert_to_boolean {src_type.__class__}")
+
+
+def convert_to_float(value, src_type, dest_type):
+    assert isinstance(dest_type, gcc.RealType)
+
+    smt_sort = get_smt_sort(dest_type)
+    if isinstance(src_type, gcc.RealType):
+        return fpToFP(RNE(), value, smt_sort)
+    if isinstance(src_type, gcc.BooleanType):
+        fp0 = FPVal(0.0, smt_sort)
+        fp1 = FPVal(1.0, smt_sort)
+        return If(value, fp1, fp0)
+    if isinstance(src_type, gcc.IntegerType):
+        return fpToFP(RNE(), value, smt_sort)
+
+    raise NotImplementedError(f"convert_to_float {src_type.__class__}")
+
+
+def process_unary(stmt, smt_bb):
+    assert len(stmt.rhs) == 1
+
+    rhs = get_tree_as_smt(stmt.rhs[0], smt_bb)
+    if stmt.exprcode == gcc.NopExpr:
+        src_type = stmt.rhs[0].type
+        dest_type = stmt.lhs.type
+        if isinstance(dest_type, gcc.IntegerType):
+            return convert_to_integer(rhs, src_type, dest_type)
+        if isinstance(dest_type, gcc.PointerType):
+            return convert_to_pointer(rhs, src_type, dest_type)
+        if isinstance(dest_type, gcc.BooleanType):
+            return convert_to_boolean(rhs, src_type)
+        if isinstance(dest_type, gcc.RealType):
+            return convert_to_float(rhs, src_type, dest_type)
+    elif stmt.exprcode == gcc.FloatExpr:
+        return convert_to_float(rhs, stmt.rhs[0].type, stmt.lhs.type)
+    elif stmt.exprcode == gcc.FixTruncExpr:
+        assert isinstance(stmt.lhs.type, gcc.IntegerType)
+        smt_bb.add_ub(Or(fpIsInf(rhs), fpIsNaN(rhs)))
+        val = fpRoundToIntegral(RTZ(), rhs)
+        smt_sort = get_smt_sort(stmt.lhs.type)
+        precision = stmt.lhs.type.precision
+        min_val = stmt.lhs.type.min_value.constant
+        max_val = stmt.lhs.type.max_value.constant
+        if stmt.lhs.type.unsigned:
+            max_as_float = fpUnsignedToFP(
+                RTZ(), BitVecVal(max_val, precision), rhs.sort()
+            )
+            min_as_float = fpUnsignedToFP(
+                RTZ(), BitVecVal(min_val, precision), rhs.sort()
+            )
+            smt_bb.add_ub(Or(val < min_as_float, val > max_as_float))
+            return fpToUBV(RTZ(), val, smt_sort)
+        max_as_float = fpSignedToFP(RTZ(), BitVecVal(max_val, precision), rhs.sort())
+        min_as_float = fpSignedToFP(RTZ(), BitVecVal(min_val, precision), rhs.sort())
+        smt_bb.add_ub(Or(val < min_as_float, val > max_as_float))
+        return fpToSBV(RTZ(), val, smt_sort)
+    elif stmt.exprcode == gcc.NegateExpr:
+        type = stmt.rhs[0].type
+        if isinstance(type, gcc.IntegerType) and not type.overflow_wraps:
+            min_int = 1 << (type.precision - 1)
+            smt_bb.add_ub(rhs == min_int)
+        return -rhs
+    elif stmt.exprcode == gcc.BitNotExpr:
+        if isinstance(stmt.lhs.type, gcc.BooleanType):
+            return Not(rhs)
+        if isinstance(stmt.lhs.type, gcc.IntegerType):
+            return ~rhs
+    elif stmt.exprcode == gcc.AbsExpr:
+        if isinstance(stmt.lhs.type, gcc.RealType):
+            return fpAbs(rhs)
+        if isinstance(stmt.lhs.type, gcc.IntegerType):
+            assert not stmt.lhs.type.unsigned
+            if not stmt.lhs.type.overflow_wraps:
+                min_int = 1 << (stmt.lhs.type.precision - 1)
+                smt_bb.add_ub(rhs == min_int)
+            return If(rhs >= 0, rhs, -rhs)
+    elif hasattr(gcc, "AbsuExpr") and stmt.exprcode == gcc.AbsuExpr:
+        if isinstance(stmt.lhs.type, gcc.IntegerType):
+            return If(rhs >= 0, rhs, -rhs)
+    elif stmt.exprcode == gcc.ViewConvertExpr:
+        # The actual work is done in get_tree_as_smt.
+        return rhs
+    elif stmt.exprcode == gcc.ParenExpr:
+        return rhs
+    elif stmt.exprcode in [
+        gcc.ParmDecl,
+        gcc.SsaName,
+        gcc.IntegerCst,
+        gcc.RealCst,
+        gcc.VarDecl,
+        gcc.ArrayRef,
+        gcc.ComponentRef,
+        gcc.MemRef,
+        gcc.AddrExpr,
+    ]:
+        return rhs
+
+    raise NotImplementedError(
+        f"process_unary {stmt.exprcode} {stmt.lhs.type.__class__}", stmt.loc
+    )
+
+
+def process_ternary(stmt, smt_bb):
+    assert len(stmt.rhs) == 3
+
+    rhs0 = get_tree_as_smt(stmt.rhs[0], smt_bb)
+    rhs1 = get_tree_as_smt(stmt.rhs[1], smt_bb)
+    rhs2 = get_tree_as_smt(stmt.rhs[2], smt_bb)
+    if stmt.exprcode == gcc.CondExpr:
+        return build_if(rhs0, rhs1, rhs2)
+
+    raise NotImplementedError(f"process_ternary {stmt.exprcode}", stmt.loc)
+
+
+def build_full_edge_cond(edge, smt_fun):
+    "Return a SMT condition for when the destination is executed."
+    src_smt_bb = smt_fun.bb2smt[edge.src]
+    if len(edge.src.succs) == 1:
+        cond = src_smt_bb.is_executed
+    elif src_smt_bb.switch_stmt is not None:
+        dest_smt_bb = smt_fun.bb2smt[edge.dest]
+        cond = None
+        for label in dest_smt_bb.labels:
+            label_cond = build_switch_cond(src_smt_bb.switch_stmt, label, dest_smt_bb)
+            if label_cond is not None:
+                if cond is None:
+                    cond = label_cond
+                else:
+                    cond = Or(cond, label_cond)
+        assert cond is not None
+        if not is_true(src_smt_bb.is_executed):
+            cond = And(cond, src_smt_bb.is_executed)
+    else:
+        assert len(edge.src.succs) == 2
+        if edge.true_value:
+            cond = src_smt_bb.smtcond
+        else:
+            cond = Not(src_smt_bb.smtcond)
+        if not is_true(src_smt_bb.is_executed):
+            cond = And(cond, src_smt_bb.is_executed)
+    return cond
+
+
+def build_if(cond, val1, val2):
+    res = val1
+    if isinstance(val1, SmtPointer):
+        if not (val1.mem_id == val2.mem_id and val1.offset == val2.offset):
+            if val1.mem_id == val2.mem_id:
+                mem_id = val1.mem_id
+            else:
+                mem_id = If(cond, val1.mem_id, val2.mem_id)
+            if val1.offset == val2.offset:
+                offset = val1.offset
+            else:
+                offset = If(cond, val1.offset, val2.offset)
+            res = SmtPointer(mem_id, offset)
+    else:
+        if not val1 == val2:
+            res = If(cond, val1, val2)
+    return res
+
+
+def process_phi_smt_args(args, smt_fun):
+    "Build SMT for a list of phi SMT args (i.e. a list of (smt_val, edge))"
+    res, _ = args[0]
+    for value, edge in args[1:]:
+        cond = build_full_edge_cond(edge, smt_fun)
+        res = build_if(cond, value, res)
+    return res
+
+
+def process_phi(args, smt_bb):
+    smt_args = []
+    for expr, edge in args:
+        if (
+            isinstance(expr, gcc.SsaName)
+            and expr not in smt_bb.smt_fun.tree_to_smt
+            and not isinstance(expr.var, gcc.ParmDecl)
+            and isinstance(expr.var, gcc.VarDecl)
+        ):
+            # We are reading from an uninitialized local variable.
+            # Make execution of this edge as UB, and create a new
+            # unconstrained constant to make the generated SMT
+            # typecheck.
+            # Note: This is normally done in get_tree_as_smt, but
+            # we cannot call it here as we only want UB when the
+            # execution followed this edge.
+            smt_bb.add_ub(build_full_edge_cond(edge, smt_bb.smt_fun))
+            value = uninit_var_to_smt(expr)
+        else:
+            value = get_tree_as_smt(expr, smt_bb)
+        smt_args.append((value, edge))
+    return process_phi_smt_args(smt_args, smt_bb.smt_fun)
+
+
+def process_GimpleCall(stmt, smt_bb):
+    if stmt.fndecl is None:
+        raise NotImplementedError("GimpleCall None", stmt.loc)
+    if stmt.fndecl.name == "__builtin_unreachable":
+        smt_bb.add_ub(BoolVal(True))
+        return
+    if stmt.fndecl.name == "__builtin_assume_aligned":
+        ptr = get_tree_as_smt(stmt.rhs[2], smt_bb)
+        alignment = stmt.rhs[3].constant
+        if alignment > 1:
+            smt_bb.add_ub((ptr.offset & (alignment - 1)) != 0)
+        smt_bb.smt_fun.tree_to_smt[stmt.lhs] = ptr
+        return
+    if stmt.fndecl.name == "__builtin_memset":
+        ptr = get_tree_as_smt(stmt.rhs[2], smt_bb)
+        val = get_tree_as_smt(stmt.rhs[3], smt_bb)
+        size = simplify(get_tree_as_smt(stmt.rhs[4], smt_bb))
+        if is_bv_value(size):
+            size = int(str(size))
+            if size < MAX_MEMORY_UNROLL_LIMIT:
+                val = Extract(7, 0, val)
+                for i in range(0, size):
+                    store_bytes(ptr.mem_id, ptr.offset + i, 1, val, smt_bb)
+                return
+    if stmt.fndecl.name in [
+        "__builtin_bswap16",
+        "__builtin_bswap32",
+        "__builtin_bswap64",
+        "__builtin_bswap128",
+    ]:
+        value = get_tree_as_smt(stmt.rhs[2], smt_bb)
+        bytes = []
+        for i in range(0, stmt.lhs.type.precision // 8):
+            bytes.append(Extract(i * 8 + 7, i * 8, value))
+        assert isinstance(stmt.lhs, gcc.SsaName)
+        smt_bb.smt_fun.tree_to_smt[stmt.lhs] = Concat(bytes)
+        return
+
+    name = ""
+    if stmt.fndecl.name.startswith("__builtin"):
+        # We skip showing non-builtin names as they only adds noise in
+        # the logs. But showing which builtins are called is useful as
+        # we may want to implement support for some of them.
+        name = stmt.fndecl.name
+    raise NotImplementedError(f"GimpleCall {name}", stmt.loc)
+
+
+def process_ArrayRef(array_ref, smt_bb):
+    assert isinstance(array_ref, gcc.ArrayRef)
+    elem_size = array_ref.type.sizeof
+    if isinstance(array_ref.index, gcc.IntegerCst):
+        offset = elem_size * array_ref.index.constant
+        if offset > (1 << PTR_OFFSET_BITS) or offset < 0:
+            smt_bb.add_ub(BoolVal(True))
+        return array_ref.array, BitVecVal(offset, 64)
+    if isinstance(array_ref.index, gcc.SsaName):
+        index = get_tree_as_smt(array_ref.index, smt_bb)
+        precision = array_ref.index.type.precision
+        if precision < 64:
+            if array_ref.index.type.unsigned:
+                index = ZeroExt(64 - precision, index)
+            else:
+                index = SignExt(64 - precision, index)
+        offset = BitVecVal(elem_size, 64) * index
+
+        eindex = ZeroExt(64, index)
+        eoffset = BitVecVal(elem_size, 128) * eindex
+        smt_bb.add_ub(UGE(eoffset, (1 << PTR_OFFSET_BITS)))
+
+        return array_ref.array, offset
+    raise NotImplementedError(
+        f"process_ArrayRef {array_ref.index.__class__}", array_ref.location
+    )
+
+
+def build_smt_addr(expr, smt_bb):
+    "Return a mem_id/offset pair for an expr representing an address."
+    if isinstance(expr, gcc.MemRef):
+        ptr = get_tree_as_smt(expr.operand, smt_bb)
+        assert isinstance(expr.offset, gcc.IntegerCst)
+        assert isinstance(expr.offset.type, gcc.PointerType)
+        mem_ref_offset = BitVecVal(expr.offset.constant, 64)
+        offset = add_to_offset(ptr.offset, mem_ref_offset, smt_bb)
+        if expr.type.alignmentof > 1:
+            smt_bb.add_ub((offset & (expr.type.alignmentof - 1)) != 0)
+        return ptr.mem_id, offset
+    if isinstance(expr, gcc.VarDecl):
+        assert expr in smt_bb.smt_fun.decl_to_id
+        mem_id = smt_bb.smt_fun.decl_to_id[expr]
+        return mem_id, BitVecVal(0, PTR_OFFSET_BITS)
+
+    if isinstance(expr, gcc.ArrayRef):
+        decl, offset = process_ArrayRef(expr, smt_bb)
+    elif isinstance(expr, gcc.ComponentRef):
+        decl = expr.target
+        offset = BitVecVal(expr.offset, 64)
+    else:
+        raise NotImplementedError(f"build_smt_addr {expr.__class__}")
+    mem_id, offset2 = build_smt_addr(decl, smt_bb)
+    new_offset = add_to_offset(offset2, offset, smt_bb)
+    return mem_id, new_offset
+
+
+def process_GimpleAssign(stmt, smt_bb):
+    if stmt.exprcode == gcc.Constructor:
+        # The python plugin does not return correct constructor
+        # objects -- the list of values is always empty. Fill the
+        # memory with 0 for now. This is wrong, but does not seem
+        # to give us too much problems (as the tests using
+        # constructors in most cases have function calls etc.)
+        #
+        # TODO: Implement gcc.Constructor in the python plugin.
+        bit_size = stmt.rhs[0].type.sizeof * 8
+        if bit_size == 0:
+            # This happens for {CLOBBER(eol) constructors for zero
+            # sized arrays such as "int x[0];".
+            rhs = None
+        else:
+            # Arbitrarily limit large arrays -- checking will be slow, and
+            # the gcc.Constructor implementation is not correct anyway,
+            # so we may as well just report an error.
+            if bit_size > 8000:
+                raise NotImplementedError(
+                    f"process_GimpleAssign large constructor ({bit_size // 8} bytes)"
+                )
+            rhs = BitVecVal(0, bit_size)
+    elif len(stmt.rhs) == 1:
+        rhs = process_unary(stmt, smt_bb)
+    elif len(stmt.rhs) == 3:
+        rhs = process_ternary(stmt, smt_bb)
+    elif isinstance(stmt.lhs.type, gcc.IntegerType):
+        rhs = process_integer_binary(stmt, smt_bb)
+    elif isinstance(stmt.lhs.type, gcc.RealType):
+        rhs = process_float_binary(stmt, smt_bb)
+    elif isinstance(stmt.lhs.type, gcc.BooleanType):
+        rhs = process_boolean_binary(stmt, smt_bb)
+    elif isinstance(stmt.lhs.type, gcc.PointerType):
+        rhs = process_pointer_binary(stmt, smt_bb)
+    else:
+        raise NotImplementedError(
+            f"process_GimpleAssign {stmt.exprcode} {stmt.lhs.type.__class__}", stmt.loc
+        )
+
+    if isinstance(stmt.lhs, gcc.SsaName):
+        smt_bb.smt_fun.tree_to_smt[stmt.lhs] = rhs
+    elif stmt.exprcode == gcc.Constructor:
+        mem_id, smt_offset = build_smt_addr(stmt.lhs, smt_bb)
+        store_bytes(mem_id, smt_offset, stmt.rhs[0].type.sizeof, rhs, smt_bb)
+    elif is_bitfield(stmt.lhs):
+        store_bitfield(stmt.lhs, rhs, smt_bb)
+    else:
+        store(stmt, rhs, smt_bb)
+
+
+def process_bb(bb, smt_fun):
+    smt_bb = smt_fun.bb2smt[bb]
+    for phi in bb.phi_nodes:
+        if isinstance(phi.lhs.type, gcc.VoidType):
+            # Skip phi nodes for the memory SSA virtual SSA names.
+            continue
+        smt_fun.tree_to_smt[phi.lhs] = process_phi(phi.args, smt_bb)
+
+    for stmt in bb.gimple:
+        if isinstance(stmt, gcc.GimpleAssign):
+            process_GimpleAssign(stmt, smt_bb)
+        elif isinstance(stmt, gcc.GimpleReturn):
+            # stmt.retval may be None for paths where the function returns
+            # without providing a value (this is allowed in C as long
+            # as the caller does not use the returned value).
+            if stmt.retval is not None:
+                retval = get_tree_as_smt(stmt.retval, smt_bb)
+                if isinstance(retval, SmtPointer):
+                    retval = retval.bitvector()
+                smt_bb.retval = retval
+        elif isinstance(stmt, gcc.GimpleCond):
+            assert smt_bb.smtcond is None
+            cond = process_comparison(stmt, smt_bb)
+            if bb.succs[0].true_value:
+                true_bb = bb.succs[0].dest
+                false_bb = bb.succs[1].dest
+            else:
+                true_bb = bb.succs[1].dest
+                false_bb = bb.succs[0].dest
+            smt_bb.smtcond = cond
+            smt_bb.true_bb = true_bb
+            smt_bb.false_bb = false_bb
+        elif isinstance(stmt, gcc.GimpleSwitch):
+            assert smt_bb.switch_stmt is None
+            smt_bb.switch_stmt = stmt
+        elif isinstance(stmt, gcc.GimpleLabel):
+            # The label has already been handled when SmtBB was created.
+            pass
+        elif isinstance(stmt, gcc.GimpleCall):
+            process_GimpleCall(stmt, smt_bb)
+        elif isinstance(stmt, gcc.GimplePredict):
+            pass
+        elif isinstance(stmt, gcc.GimpleNop):
+            # GimpleNop does not do anything. Ignore it.
+            pass
+        else:
+            raise NotImplementedError(f"process_bb {stmt.__class__}", stmt.loc)
+
+
+def init_common_state(fun):
+    next_id = 1
+    memory_objects = []
+    mem_objects = Array(
+        "memory_objects",
+        BitVecSort(PTR_ID_BITS),
+        ArraySort(BitVecSort(PTR_OFFSET_BITS), BitVecSort(8)),
+    )
+    mem_sizes = K(BitVecSort(PTR_ID_BITS), BitVecVal(0, PTR_OFFSET_BITS))
+    for var in gcc.get_variables():
+        if isinstance(var.decl.type, gcc.ArrayType) and not isinstance(
+            var.decl.type.range, gcc.IntegerType
+        ):
+            # This is an array declared without size. Invent a size...
+            size = ANON_MEM_SIZE
+        else:
+            size = var.decl.type.sizeof
+        memory_object = MemoryBlock(var.decl, size, next_id)
+        memory_objects.append(memory_object)
+
+        mem_id = BitVecVal(next_id, PTR_ID_BITS)
+        mem_objects = Store(mem_objects, mem_id, memory_object.mem_array)
+        mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+
+        next_id = next_id + 1
+
+    fun_args = []
+    arg_ptrs = []
+    for arg in fun.decl.arguments:
+        if isinstance(arg.type, gcc.PointerType):
+            ptr = Const(arg.name, BitVecSort(64))
+            mem_id = Extract(63, PTR_OFFSET_BITS, ptr)
+            offset = Extract(PTR_OFFSET_BITS - 1, 0, ptr)
+            smt_arg = SmtPointer(mem_id, offset)
+            arg_ptrs.append(smt_arg)
+
+            memory_object = MemoryBlock(None, ANON_MEM_SIZE, next_id)
+            memory_objects.append(memory_object)
+
+            mem_id = BitVecVal(next_id, PTR_ID_BITS)
+            mem_objects = Store(mem_objects, mem_id, memory_object.mem_array)
+            mem_sizes = Store(
+                mem_sizes, mem_id, BitVecVal(ANON_MEM_SIZE, PTR_OFFSET_BITS)
+            )
+
+            next_id = next_id + 1
+        else:
+            smt_sort = get_smt_sort(arg.type)
+            smt_arg = Const(arg.name, smt_sort)
+        fun_args.append((smt_arg, arg.type))
+
+    ptr_constraints = []
+    for ptr in arg_ptrs:
+        ptr_constraints.append(And(ptr.mem_id > 0, ptr.mem_id < next_id))
+        smt_size = Select(mem_sizes, mem_id)
+        ptr_constraints.append(And(ptr.offset >= 0, ptr.offset < smt_size))
+
+    return CommonState(
+        memory_objects, next_id, ptr_constraints, mem_objects, mem_sizes, fun_args
+    )
+
+
+def find_unimplemented(fun):
+    """Check if the function contains unimplemented statements.
+
+    This function is useful to run before doing any other work as
+    it takes a long time to generate SMT for large functions, and we
+    may spend minutes before finding the first unimplemented stmt."""
+    for bb in fun.cfg.inverted_post_order:
+        for stmt in bb.gimple:
+            if isinstance(stmt, gcc.GimpleCall):
+                if stmt.fndecl is None:
+                    raise NotImplementedError("GimpleCall", stmt.loc)
+                if not stmt.fndecl.name.startswith("__builtin"):
+                    raise NotImplementedError("GimpleCall", stmt.loc)
+
+
+def process_function(fun, state, reuse):
+    if has_loop(fun):
+        raise NotImplementedError("Loops", fun.decl.location)
+
+    # Adding SMT statements is very slow in large functions. I have not
+    # investigated why, but it feels like the SMT library is doing some
+    # kind of garbage collection (e.g. most operations are fast, but some
+    # "randomly" takes a lot of time.)
+    # Most large functions cannot be checked anyway as they contain
+    # function calls, etc. So we check for obviously unimplemented
+    # operations before starting processing the function. It saves
+    # > 2 hours when checking gcc.dg/torture/arm-fp16-int-convert-alt.c
+    find_unimplemented(fun)
+
+    smt_fun = SmtFunction(fun, state)
+
+    decl = fun.decl
+    if len(decl.arguments) != len(state.fun_args):
+        raise Error("Incorrect number of arguments", fun.decl.location)
+    if decl.arguments:
+        for arg, smt_arg in zip(decl.arguments, state.fun_args):
+            if arg.type != smt_arg[1]:
+                raise Error("Incorrect type for argument", arg.location)
+            smt_fun.tree_to_smt[arg] = smt_arg[0]
+
+    mem_objects = state.mem_objects
+    mem_sizes = state.mem_sizes
+    next_id = state.next_id
+    memory_objects = state.global_memory[:]
+    if reuse:
+        for memory_object in state.local_memory:
+            memory_objects.append(memory_object)
+            size = memory_object.size
+            mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
+            mem_objects = Store(mem_objects, mem_id, memory_object.mem_array)
+            mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+
+    local_memory = []
+    for decl in smt_fun.fun.local_decls:
+        if decl.static:
+            # Local static decls are included in the global decls.
+            continue
+
+        if reuse and decl in state.decl_to_memory:
+            continue
+
+        size = decl.type.sizeof
+        memory_object = MemoryBlock(decl, size, next_id)
+        local_memory.append(memory_object)
+        state.decl_to_memory[decl] = memory_object
+        next_id = next_id + 1
+        memory_objects.append(memory_object)
+
+        mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
+        mem_objects = Store(mem_objects, mem_id, memory_object.mem_array)
+        mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+
+    state.next_id = next_id
+    if not reuse:
+        state.local_memory = local_memory
+
+    for obj in memory_objects:
+        smt_fun.decl_to_id[obj.decl] = BitVecVal(obj.mem_id, PTR_ID_BITS)
+
+    for bb in fun.cfg.inverted_post_order:
+        SmtBB(bb, smt_fun, mem_objects, mem_sizes)
+        process_bb(bb, smt_fun)
+
+    if not isinstance(fun.decl.result.type, gcc.VoidType):
+        results = []
+        for edge in fun.cfg.exit.preds:
+            src_smt_bb = smt_fun.bb2smt[edge.src]
+            if src_smt_bb.retval is None:
+                # The function is not returning a value when following this
+                # edge. This is allowed -- it is only UB in C in the caller
+                # if it is using the nonexisting value.
+                # Create a symbolic constant to make checking work.
+                if state.retval is None:
+                    retval_sort = get_smt_sort(fun.decl.result.type)
+                    state.retval = Const(".retval", retval_sort)
+                retval = state.retval
+            else:
+                retval = src_smt_bb.retval
+            results.append((retval, edge))
+        if results:
+            smt_fun.retval = process_phi_smt_args(results, smt_fun)
+    exit_smt_bb = smt_fun.bb2smt[fun.cfg.exit]
+    smt_fun.mem_objects = exit_smt_bb.smt_mem_objects
+    smt_fun.mem_sizes = exit_smt_bb.smt_mem_sizes
+
+    for bb in fun.cfg.inverted_post_order:
+        smt_bb = smt_fun.bb2smt[bb]
+        if smt_bb.invokes_ub is not None:
+            smt_fun.add_ub(And(smt_bb.is_executed, smt_bb.invokes_ub))
+
+    return smt_fun
+
+
+def init_solver(src_smt_fun):
+    solver = Solver()
+    if SOLVER_TIMEOUT > 0:
+        solver.set("timeout", SOLVER_TIMEOUT * 1000)
+    if SOLVER_MAX_MEMORY > 0:
+        solver.set("max_memory", SOLVER_MAX_MEMORY)
+    if src_smt_fun.invokes_ub is not None:
+        solver.append(Not(src_smt_fun.invokes_ub))
+    for constraint in src_smt_fun.state.ptr_constraints:
+        solver.append(constraint)
+    return solver
+
+
+def show_solver_result(solver, transform_name, name, location, verbose):
+    if verbose > 0:
+        print(f"Checking {name}")
+    if verbose > 1:
+        print(solver.to_smt2())
+    res = solver.check()
+    if res == sat:
+        if transform_name:
+            msg = f"Transformation {transform_name}"
+        else:
+            msg = "Transformation"
+        msg = msg + f" is not correct ({name}).\n{solver.model()}"
+        gcc.inform(location, msg)
+        return False
+    if res != unsat:
+        if transform_name:
+            msg = f"Analysis of {transform_name} timed out ({name})"
+        else:
+            msg = f"Analysis timed out ({name})"
+        gcc.inform(location, msg)
+    return True
+
+
+def check(
+    src_smt_fun,
+    tgt_smt_fun,
+    location,
+    report_success,
+    verbose=0,
+    transform_name="",
+):
+    if verbose > 0 and transform_name:
+        print(f"{transform_name}:")
+
+    src_retval = src_smt_fun.retval
+    tgt_retval = tgt_smt_fun.retval
+
+    # We check the return value before we check if tgt has more UB than src.
+    # This is conceptually wrong, but it does not matter for correctness,
+    # and it is somewhat more useful as we then can differentiate between
+    # cases where we get a different value (either for incorrect calculations,
+    # or because of new UB) and cases where we have new UB that does not
+    # affect the result (i.e. much of the integer wrapping).
+
+    # Check if return value is OK.
+    if src_retval is not None:
+        solver = init_solver(src_smt_fun)
+        solver.append(src_retval != tgt_retval)
+        success = show_solver_result(
+            solver, transform_name, "retval", location, verbose
+        )
+        if not success:
+            if verbose > 0:
+                model = solver.model()
+                print(f"src retval: {model.eval(src_retval)}")
+                print(f"tgt retval: {model.eval(tgt_retval)}")
+            return
+
+    # Check if tgt has more UB than src.
+    if tgt_smt_fun.invokes_ub is not None:
+        solver = init_solver(src_smt_fun)
+        solver.append(tgt_smt_fun.invokes_ub)
+        success = show_solver_result(solver, transform_name, "UB", location, verbose)
+        if not success:
+            return
+
+    # Check global memory.
+    if src_smt_fun.state.global_memory:
+        solver = init_solver(src_smt_fun)
+        ptr = Const(".ptr", BitVecSort(64))
+        mem_id = Extract(63, PTR_OFFSET_BITS, ptr)
+        offset = Extract(PTR_OFFSET_BITS - 1, 0, ptr)
+        valid_ptr = BoolVal(False)
+        for mem_obj in src_smt_fun.state.global_memory:
+            valid_id = mem_id == mem_obj.mem_id
+            valid_offset = ULT(offset, Select(src_smt_fun.state.mem_sizes, mem_id))
+            valid_ptr = Or(valid_ptr, And(valid_id, valid_offset))
+        src_array = Select(src_smt_fun.mem_objects, mem_id)
+        tgt_array = Select(tgt_smt_fun.mem_objects, mem_id)
+        solver.append(valid_ptr)
+        solver.append(Select(src_array, offset) != Select(tgt_array, offset))
+        success = show_solver_result(
+            solver, transform_name, "memory", location, verbose
+        )
+        if not success:
+            if verbose > 0:
+                model = solver.model()
+                print(f"src *.ptr: {model.eval(Select(src_array, offset))}")
+                print(f"tgt *.ptr: {model.eval(Select(tgt_array, offset))}")
+            return
+
+    if report_success:
+        gcc.inform(location, "Transformation seems to be correct.")
