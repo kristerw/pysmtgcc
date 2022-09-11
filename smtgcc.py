@@ -246,6 +246,8 @@ def load_bytes(mem_id, offset, size, smt_bb):
     if size > MAX_MEMORY_UNROLL_LIMIT:
         raise NotImplementedError(f"load_bytes too big ({size})")
 
+    add_out_of_bound_ub_check(mem_id, offset, size, smt_bb)
+
     # Load the "byte" values from the memory object.
     bytes = []
     array = Select(smt_bb.smt_mem_objects, mem_id)
@@ -256,12 +258,6 @@ def load_bytes(mem_id, offset, size, smt_bb):
             off = simplify(off)
         byte_value = Select(array, off)
         bytes.insert(0, byte_value)
-
-    # Add UB checks for out of bounds access.
-    smt_bb.add_ub(UGE(mem_id, smt_bb.smt_fun.state.next_id))
-    smt_size = Select(smt_bb.smt_mem_sizes, mem_id)
-    smt_bb.add_ub(UGT(offset + size, smt_size))
-    smt_bb.add_ub(UGE(offset, offset + size))
 
     # Construct a bit-vector for the loaded value.
     if size == 1:
@@ -301,26 +297,49 @@ def load_bitfield(expr, smt_bb):
     return Extract(expr.bitoffset + expr.type.precision - 1, expr.bitoffset, bytes)
 
 
+def add_out_of_bound_ub_check(mem_id, offset, size, smt_bb):
+    is_valid_mem_id = UGE(mem_id, smt_bb.smt_fun.state.next_id)
+    if is_bv_value(mem_id):
+        is_valid_mem_id = simplify(is_valid_mem_id)
+        if is_true(is_valid_mem_id):
+            smt_bb.add_ub(is_valid_mem_id)
+        else:
+            assert is_false(is_valid_mem_id)
+    else:
+        smt_bb.add_ub(is_valid_mem_id)
+
+    smt_size = Select(smt_bb.smt_mem_sizes, mem_id)
+    if is_bv_value(mem_id):
+        smt_size = simplify(smt_size)
+    is_out_of_bound = Or(UGT(offset + size, smt_size), UGE(offset, offset + size))
+    if is_bv_value(smt_size) and is_bv_value(offset):
+        is_out_of_bound = simplify(is_out_of_bound)
+        if is_true(is_out_of_bound):
+            smt_bb.add_ub(is_out_of_bound)
+        else:
+            assert is_false(is_out_of_bound)
+    else:
+        smt_bb.add_ub(is_out_of_bound)
+
+
 def store_bytes(mem_id, offset, size, value, smt_bb):
     assert size > 0
     if size > MAX_MEMORY_UNROLL_LIMIT:
         raise NotImplementedError(f"store_bytes too big ({size})")
+
+    add_out_of_bound_ub_check(mem_id, offset, size, smt_bb)
 
     # Write the value to the memory object.
     array = Select(smt_bb.smt_mem_objects, mem_id)
     is_constant_offset = is_bv_value(offset)
     for i in range(0, size):
         byte_value = Extract(i * 8 + 7, i * 8, value)
+        if is_bv_value(value):
+            byte_value = simplify(byte_value)
         off = offset + i
         if is_constant_offset:
             off = simplify(off)
         array = Store(array, off, byte_value)
-
-    # Add UB checks for out of bounds access.
-    smt_bb.add_ub(UGE(mem_id, smt_bb.smt_fun.state.next_id))
-    smt_size = Select(smt_bb.smt_mem_sizes, mem_id)
-    smt_bb.add_ub(UGT(offset + size, smt_size))
-    smt_bb.add_ub(UGE(offset, offset + size))
 
     # Update the array of memory objects.
     smt_bb.smt_mem_objects = Store(smt_bb.smt_mem_objects, mem_id, array)
