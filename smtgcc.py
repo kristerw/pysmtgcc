@@ -45,7 +45,7 @@ class CommonState:
         global_memory,
         next_id,
         ptr_constraints,
-        mem_objects,
+        memory,
         mem_sizes,
         fun_args,
     ):
@@ -53,7 +53,7 @@ class CommonState:
         self.local_memory = None
         self.next_id = next_id
         self.ptr_constraints = ptr_constraints
-        self.mem_objects = mem_objects
+        self.memory = memory
         self.mem_sizes = mem_sizes
         self.decl_to_memory = {}
         self.fun_args = fun_args
@@ -98,7 +98,7 @@ class SmtFunction:
         # Function return
         self.retval = None
         self.invokes_ub = None
-        self.mem_objects = None
+        self.memory = None
         self.mem_sizes = None
 
     def add_ub(self, smt):
@@ -109,7 +109,7 @@ class SmtFunction:
 
 
 class SmtBB:
-    def __init__(self, bb, smt_fun, mem_objects, mem_sizes):
+    def __init__(self, bb, smt_fun, mem_sizes):
         self.bb = bb
         self.smt_fun = smt_fun
         self.invokes_ub = None
@@ -120,19 +120,17 @@ class SmtBB:
         smt_fun.bb2smt[bb] = self
 
         if len(bb.preds) == 0:
-            self.smt_mem_objects = mem_objects
-            self.smt_mem_sizes = mem_sizes
+            self.memory = smt_fun.state.memory
+            self.mem_sizes = mem_sizes
         else:
-            mem_objects = []
+            memory = []
             mem_sizes = []
             for edge in bb.preds:
                 src_smt_bb = smt_fun.bb2smt[edge.src]
-                objects = src_smt_bb.smt_mem_objects
-                mem_objects.append((objects, edge))
-                sizes = src_smt_bb.smt_mem_sizes
-                mem_sizes.append((sizes, edge))
-            self.smt_mem_objects = process_phi_smt_args(mem_objects, smt_fun)
-            self.smt_mem_sizes = process_phi_smt_args(mem_sizes, smt_fun)
+                memory.append((src_smt_bb.memory, edge))
+                mem_sizes.append((src_smt_bb.mem_sizes, edge))
+            self.memory = process_phi_smt_args(memory, smt_fun)
+            self.mem_sizes = process_phi_smt_args(mem_sizes, smt_fun)
 
         # Create condition telling if this BB is executed or not.
         if len(bb.preds) == 0:
@@ -248,15 +246,16 @@ def load_bytes(mem_id, offset, size, smt_bb):
 
     add_out_of_bound_ub_check(mem_id, offset, size, smt_bb)
 
-    # Load the "byte" values from the memory object.
+    # Load the "byte" values from memory.
     bytes = []
-    array = Select(smt_bb.smt_mem_objects, mem_id)
-    is_constant_offset = is_bv_value(offset)
+    ptr = Concat([mem_id, offset])
+    if is_bv_value(mem_id) and is_bv_value(offset):
+        ptr = simplify(ptr)
     for i in range(0, size):
-        off = offset + i
-        if is_constant_offset:
-            off = simplify(off)
-        byte_value = Select(array, off)
+        p = ptr + i
+        if is_bv_value(ptr):
+            p = simplify(p)
+        byte_value = Select(smt_bb.memory, p)
         bytes.insert(0, byte_value)
 
     # Construct a bit-vector for the loaded value.
@@ -308,7 +307,7 @@ def add_out_of_bound_ub_check(mem_id, offset, size, smt_bb):
     else:
         smt_bb.add_ub(is_valid_mem_id)
 
-    smt_size = Select(smt_bb.smt_mem_sizes, mem_id)
+    smt_size = Select(smt_bb.mem_sizes, mem_id)
     if is_bv_value(mem_id):
         smt_size = simplify(smt_size)
     is_out_of_bound = Or(UGT(offset + size, smt_size), UGE(offset, offset + size))
@@ -329,20 +328,17 @@ def store_bytes(mem_id, offset, size, value, smt_bb):
 
     add_out_of_bound_ub_check(mem_id, offset, size, smt_bb)
 
-    # Write the value to the memory object.
-    array = Select(smt_bb.smt_mem_objects, mem_id)
-    is_constant_offset = is_bv_value(offset)
+    ptr = Concat([mem_id, offset])
+    if is_bv_value(mem_id) and is_bv_value(offset):
+        ptr = simplify(ptr)
     for i in range(0, size):
         byte_value = Extract(i * 8 + 7, i * 8, value)
         if is_bv_value(value):
             byte_value = simplify(byte_value)
-        off = offset + i
-        if is_constant_offset:
-            off = simplify(off)
-        array = Store(array, off, byte_value)
-
-    # Update the array of memory objects.
-    smt_bb.smt_mem_objects = Store(smt_bb.smt_mem_objects, mem_id, array)
+        p = ptr + i
+        if is_bv_value(ptr):
+            p = simplify(p)
+        smt_bb.memory = Store(smt_bb.memory, p, byte_value)
 
 
 def store(stmt, value, smt_bb):
@@ -1277,11 +1273,6 @@ def process_bb(bb, smt_fun):
 def init_common_state(fun):
     next_id = 1
     memory_objects = []
-    mem_objects = Array(
-        "memory_objects",
-        BitVecSort(PTR_ID_BITS),
-        ArraySort(BitVecSort(PTR_OFFSET_BITS), BitVecSort(8)),
-    )
     mem_sizes = K(BitVecSort(PTR_ID_BITS), BitVecVal(0, PTR_OFFSET_BITS))
     for var in gcc.get_variables():
         if isinstance(var.decl.type, gcc.ArrayType) and not isinstance(
@@ -1295,7 +1286,6 @@ def init_common_state(fun):
         memory_objects.append(memory_object)
 
         mem_id = BitVecVal(next_id, PTR_ID_BITS)
-        mem_objects = Store(mem_objects, mem_id, memory_object.mem_array)
         mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
 
         next_id = next_id + 1
@@ -1314,7 +1304,6 @@ def init_common_state(fun):
             memory_objects.append(memory_object)
 
             mem_id = BitVecVal(next_id, PTR_ID_BITS)
-            mem_objects = Store(mem_objects, mem_id, memory_object.mem_array)
             mem_sizes = Store(
                 mem_sizes, mem_id, BitVecVal(ANON_MEM_SIZE, PTR_OFFSET_BITS)
             )
@@ -1331,8 +1320,9 @@ def init_common_state(fun):
         smt_size = Select(mem_sizes, mem_id)
         ptr_constraints.append(And(ptr.offset >= 0, ptr.offset < smt_size))
 
+    memory = Array(".memory", BitVecSort(64), BitVecSort(8))
     return CommonState(
-        memory_objects, next_id, ptr_constraints, mem_objects, mem_sizes, fun_args
+        memory_objects, next_id, ptr_constraints, memory, mem_sizes, fun_args
     )
 
 
@@ -1376,7 +1366,6 @@ def process_function(fun, state, reuse):
                 raise Error("Incorrect type for argument", arg.location)
             smt_fun.tree_to_smt[arg] = smt_arg[0]
 
-    mem_objects = state.mem_objects
     mem_sizes = state.mem_sizes
     next_id = state.next_id
     memory_objects = state.global_memory[:]
@@ -1385,7 +1374,6 @@ def process_function(fun, state, reuse):
             memory_objects.append(memory_object)
             size = memory_object.size
             mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
-            mem_objects = Store(mem_objects, mem_id, memory_object.mem_array)
             mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
 
     local_memory = []
@@ -1405,7 +1393,6 @@ def process_function(fun, state, reuse):
         memory_objects.append(memory_object)
 
         mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
-        mem_objects = Store(mem_objects, mem_id, memory_object.mem_array)
         mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
 
     state.next_id = next_id
@@ -1416,7 +1403,7 @@ def process_function(fun, state, reuse):
         smt_fun.decl_to_id[obj.decl] = BitVecVal(obj.mem_id, PTR_ID_BITS)
 
     for bb in fun.cfg.inverted_post_order:
-        SmtBB(bb, smt_fun, mem_objects, mem_sizes)
+        SmtBB(bb, smt_fun, mem_sizes)
         process_bb(bb, smt_fun)
 
     if not isinstance(fun.decl.result.type, gcc.VoidType):
@@ -1438,8 +1425,8 @@ def process_function(fun, state, reuse):
         if results:
             smt_fun.retval = process_phi_smt_args(results, smt_fun)
     exit_smt_bb = smt_fun.bb2smt[fun.cfg.exit]
-    smt_fun.mem_objects = exit_smt_bb.smt_mem_objects
-    smt_fun.mem_sizes = exit_smt_bb.smt_mem_sizes
+    smt_fun.memory = exit_smt_bb.memory
+    smt_fun.mem_sizes = exit_smt_bb.mem_sizes
 
     for bb in fun.cfg.inverted_post_order:
         smt_bb = smt_fun.bb2smt[bb]
@@ -1539,18 +1526,18 @@ def check(
             valid_id = mem_id == mem_obj.mem_id
             valid_offset = ULT(offset, Select(src_smt_fun.state.mem_sizes, mem_id))
             valid_ptr = Or(valid_ptr, And(valid_id, valid_offset))
-        src_array = Select(src_smt_fun.mem_objects, mem_id)
-        tgt_array = Select(tgt_smt_fun.mem_objects, mem_id)
+        src_mem = src_smt_fun.memory
+        tgt_mem = tgt_smt_fun.memory
         solver.append(valid_ptr)
-        solver.append(Select(src_array, offset) != Select(tgt_array, offset))
+        solver.append(Select(src_mem, ptr) != Select(tgt_mem, ptr))
         success = show_solver_result(
             solver, transform_name, "memory", location, verbose
         )
         if not success:
             if verbose > 0:
                 model = solver.model()
-                print(f"src *.ptr: {model.eval(Select(src_array, offset))}")
-                print(f"tgt *.ptr: {model.eval(Select(tgt_array, offset))}")
+                print(f"src *.ptr: {model.eval(Select(src_mem, offset))}")
+                print(f"tgt *.ptr: {model.eval(Select(tgt_mem, offset))}")
             return
 
     if report_success:
