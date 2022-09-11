@@ -1112,8 +1112,15 @@ def process_ArrayRef(array_ref, smt_bb):
     elem_size = array_ref.type.sizeof
     if isinstance(array_ref.index, gcc.IntegerCst):
         offset = elem_size * array_ref.index.constant
-        if offset > (1 << PTR_OFFSET_BITS) or offset < 0:
-            smt_bb.add_ub(BoolVal(True))
+        if array_ref.array.type.range is None:
+            if offset > (1 << PTR_OFFSET_BITS) or offset < 0:
+                smt_bb.add_ub(BoolVal(True))
+        else:
+            # TODO: Handle "one past" when not dereferenced.
+            range = array_ref.array.type.range
+            assert range.min_value.constant == 0
+            if array_ref.index.constant > range.max_value.constant:
+                smt_bb.add_ub(BoolVal(True))
         return array_ref.array, BitVecVal(offset, 64)
     if isinstance(array_ref.index, gcc.SsaName):
         index = get_tree_as_smt(array_ref.index, smt_bb)
@@ -1124,11 +1131,15 @@ def process_ArrayRef(array_ref, smt_bb):
             else:
                 index = SignExt(64 - precision, index)
         offset = BitVecVal(elem_size, 64) * index
-
-        eindex = ZeroExt(64, index)
-        eoffset = BitVecVal(elem_size, 128) * eindex
-        smt_bb.add_ub(UGE(eoffset, (1 << PTR_OFFSET_BITS)))
-
+        if array_ref.array.type.range is None:
+            eindex = ZeroExt(64, index)
+            eoffset = BitVecVal(elem_size, 128) * eindex
+            smt_bb.add_ub(UGE(eoffset, (1 << PTR_OFFSET_BITS)))
+        else:
+            # TODO: Handle "one past" when not dereferenced.
+            range = array_ref.array.type.range
+            assert range.min_value.constant == 0
+            smt_bb.add_ub(UGT(index, range.max_value.constant))
         return array_ref.array, offset
     raise NotImplementedError(
         f"process_ArrayRef {array_ref.index.__class__}", array_ref.location
