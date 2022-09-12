@@ -1460,16 +1460,16 @@ def show_solver_result(solver, transform_name, name, location, verbose):
             msg = f"Transformation {transform_name}"
         else:
             msg = "Transformation"
-        msg = msg + f" is not correct ({name}).\n{solver.model()}"
+        msg = msg + f" is not correct ({name})."
         gcc.inform(location, msg)
-        return False
+        return solver.model()
     if res != unsat:
         if transform_name:
             msg = f"Analysis of {transform_name} timed out ({name})"
         else:
             msg = f"Analysis timed out ({name})"
         gcc.inform(location, msg)
-    return True
+    return None
 
 
 def check(
@@ -1497,22 +1497,24 @@ def check(
     if src_retval is not None:
         solver = init_solver(src_smt_fun)
         solver.append(src_retval != tgt_retval)
-        success = show_solver_result(
+        model = show_solver_result(
             solver, transform_name, "retval", location, verbose
         )
-        if not success:
-            if verbose > 0:
-                model = solver.model()
-                print(f"src retval: {model.eval(src_retval)}")
-                print(f"tgt retval: {model.eval(tgt_retval)}")
+        if model is not None:
+            msg = f"{model}\n"
+            msg = msg + f"src retval: {model.eval(src_retval)}\n"
+            msg = msg + f"tgt retval: {model.eval(tgt_retval)}"
+            gcc.inform(location, msg)
             return
 
     # Check if tgt has more UB than src.
     if tgt_smt_fun.invokes_ub is not None:
         solver = init_solver(src_smt_fun)
         solver.append(tgt_smt_fun.invokes_ub)
-        success = show_solver_result(solver, transform_name, "UB", location, verbose)
-        if not success:
+        model = show_solver_result(solver, transform_name, "UB", location, verbose)
+        if model is not None:
+            msg = f"{model}\n"
+            gcc.inform(location, msg)
             return
 
     # Check global memory.
@@ -1530,14 +1532,14 @@ def check(
         tgt_mem = tgt_smt_fun.memory
         solver.append(valid_ptr)
         solver.append(Select(src_mem, ptr) != Select(tgt_mem, ptr))
-        success = show_solver_result(
+        model = show_solver_result(
             solver, transform_name, "memory", location, verbose
         )
-        if not success:
-            if verbose > 0:
-                model = solver.model()
-                print(f"src *.ptr: {model.eval(Select(src_mem, ptr))}")
-                print(f"tgt *.ptr: {model.eval(Select(tgt_mem, ptr))}")
+        if model is not None:
+            msg = f"{model}\n"
+            msg = msg + f"src *.ptr: {model.eval(Select(src_mem, ptr))}\n"
+            msg = msg + f"tgt *.ptr: {model.eval(Select(tgt_mem, ptr))}"
+            gcc.inform(location, msg)
             return
 
     if report_success:

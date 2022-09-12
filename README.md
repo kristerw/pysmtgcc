@@ -42,9 +42,13 @@ gives us the output
 ```
 pr106523.c: In function 'f7':
 pr106523.c:1:15: note: Transformation ccp -> forwprop is not correct (retval).
-[y = 13, x = 198]
+    1 | unsigned char f7(unsigned char x, unsigned int y)
+      |               ^~
+pr106523.c:1:15: note: [y = 13, x = 198]
+src retval: 24
+tgt retval: 216
 ```
-telling us that the `forwprop` pass miscompiled the function so that it now returns a different value when called as `f7(198, 13)`.
+telling us that the forwprop[^passes] pass miscompiled the function, so it now returns `216` instead of `24` when called as `f7(198, 13)`.
 
 
 # Using plugin2.py
