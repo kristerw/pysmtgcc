@@ -1536,8 +1536,8 @@ def check(
         if not success:
             if verbose > 0:
                 model = solver.model()
-                print(f"src *.ptr: {model.eval(Select(src_mem, offset))}")
-                print(f"tgt *.ptr: {model.eval(Select(tgt_mem, offset))}")
+                print(f"src *.ptr: {model.eval(Select(src_mem, ptr))}")
+                print(f"tgt *.ptr: {model.eval(Select(tgt_mem, ptr))}")
             return
 
     if report_success:
