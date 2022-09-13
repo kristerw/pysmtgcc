@@ -36,7 +36,7 @@ unsigned char f7(unsigned char x, unsigned int y)
 ```
 with a compiler where PR 106523 is not fixed (for example, GCC 12.2) using `plugin1.py`
 ```
-gcc -O3 -c -fplugin=python -fplugin-arg-python-script=plugin1.py pr106523.c
+gcc -O3 -fno-strict-aliasing -c -fplugin=python -fplugin-arg-python-script=plugin1.py pr106523.c
 ```
 gives us the output
 ```
@@ -68,7 +68,7 @@ int tgt(int a, int b, int c)
 ```
 by compiling as
 ```
-gcc -O3 -c -fplugin=python -fplugin-arg-python-script=plugin2.py example.c
+gcc -O3 -fno-strict-aliasing -c -fplugin=python -fplugin-arg-python-script=plugin2.py example.c
 ```
 gives us the output
 ```
@@ -81,7 +81,7 @@ example.c:6:5: note: [c = 1793412222, a = 3429154139, b = 2508144171]
 telling us that `tgt` invokes undefined behavior in cases where `src` does not,
 and gives us an example of input where this happen (the values are, unfortunately, written as unsigned values. In this case, it means `[c = 1793412222, a = -865813157, b = -1786823125]`).
 
-`plugin2.py` works on the IR from the `ssa` pass, i.e., early enough that the compiler has not done many optimizations. But note that GCC does peephole optimizations earlier (even when compiling as `-O0`), so you cannot use this to test such optimization. It is good practice to check with `-fdump-tree-ssa` that the IR used by the tool looks as expected.
+**Note**: `plugin2.py` works on the IR from the `ssa` pass, i.e., early enough that the compiler has not done many optimizations. But GCC does peephole optimizations earlier (even when compiling as `-O0`), so you cannot use this plugin to test such optimizations. It is good practice to check with `-fdump-tree-ssa` that the IR used by the tool looks as expected.
 
 # Limitations
 TBD
