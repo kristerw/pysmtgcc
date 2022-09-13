@@ -84,4 +84,16 @@ and gives us an example of input where this happen (the values are, unfortunatel
 **Note**: `plugin2.py` works on the IR from the `ssa` pass, i.e., early enough that the compiler has not done many optimizations. But GCC does peephole optimizations earlier (even when compiling as `-O0`), so you cannot use this plugin to test such optimizations. It is good practice to check with `-fdump-tree-ssa` that the IR used by the tool looks as expected.
 
 # Limitations
-TBD
+Some of the major limitations in the current version:
+* Function calls are not implemented.
+* Loops are not implemented.
+* The `CONSTRUCTOR` tree-code is ignored. This is used for brace-enclosed initializers for a structure or an array, which means that the tool will report bogus errors for most programs initializing structures and arrays.
+* Support for memory operations is a bit shaky:
+  * The tool is not tracking uninitialized memory.
+  * It is confused about what memory can be pointed to by global pointers.
+  * `malloc` etc. are not supported.
+  * The tool often reports spurious memory-related errors unless `-fno-strict-aliasing` is passed to the compiler.
+  * Pointer size/memory order is hardcoded as 64 bits/little-endian.
+  * ...
+
+Another annoying limitation is that GCC is doing folding (i.e., peephole optimizations) before running GIMPLE passes, so the tool will not find bugs in that code. Alive/Alive2 found several bugs in the LLVM equivalent `instcombine` pass, so it is likely that GCC also has bugs in its peephole optimizations.
