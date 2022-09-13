@@ -1462,14 +1462,14 @@ def show_solver_result(solver, transform_name, name, location, verbose):
             msg = "Transformation"
         msg = msg + f" is not correct ({name})."
         gcc.inform(location, msg)
-        return solver.model()
+        return False, solver.model()
     if res != unsat:
         if transform_name:
             msg = f"Analysis of {transform_name} timed out ({name})"
         else:
             msg = f"Analysis timed out ({name})"
         gcc.inform(location, msg)
-    return None
+    return res != unsat, None
 
 
 def check(
@@ -1494,12 +1494,14 @@ def check(
     # affect the result (i.e. much of the integer wrapping).
 
     # Check if return value is OK.
+    success = True
     if src_retval is not None:
         solver = init_solver(src_smt_fun)
         solver.append(src_retval != tgt_retval)
-        model = show_solver_result(
+        timeout, model = show_solver_result(
             solver, transform_name, "retval", location, verbose
         )
+        success = success and not timeout
         if model is not None:
             msg = f"{model}\n"
             msg = msg + f"src retval: {model.eval(src_retval)}\n"
@@ -1511,7 +1513,10 @@ def check(
     if tgt_smt_fun.invokes_ub is not None:
         solver = init_solver(src_smt_fun)
         solver.append(tgt_smt_fun.invokes_ub)
-        model = show_solver_result(solver, transform_name, "UB", location, verbose)
+        timeout, model = show_solver_result(
+            solver, transform_name, "UB", location, verbose
+        )
+        success = success and not timeout
         if model is not None:
             msg = f"{model}\n"
             gcc.inform(location, msg)
@@ -1532,9 +1537,10 @@ def check(
         tgt_mem = tgt_smt_fun.memory
         solver.append(valid_ptr)
         solver.append(Select(src_mem, ptr) != Select(tgt_mem, ptr))
-        model = show_solver_result(
+        timeout, model = show_solver_result(
             solver, transform_name, "memory", location, verbose
         )
+        success = success and not timeout
         if model is not None:
             msg = f"{model}\n"
             msg = msg + f"src *.ptr: {model.eval(Select(src_mem, ptr))}\n"
@@ -1542,5 +1548,5 @@ def check(
             gcc.inform(location, msg)
             return
 
-    if report_success:
+    if success and report_success:
         gcc.inform(location, "Transformation seems to be correct.")
