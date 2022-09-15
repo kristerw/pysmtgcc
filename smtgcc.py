@@ -116,7 +116,7 @@ class SmtBB:
         self.smtcond = None
         self.retval = None
         self.labels = self._find_labels()
-        self.switch_stmt = None
+        self.switch_label_to_cond = None
         smt_fun.bb2smt[bb] = self
 
         if len(bb.preds) == 0:
@@ -161,11 +161,11 @@ class SmtBB:
             self.invokes_ub = Or(self.invokes_ub, smt)
 
 
-def build_switch_cond(stmt, label, smt_bb):
-    "Build SMT condition corresponding to the case(s) jumping to the label."
+def build_switch_label_to_cond(stmt, smt_bb):
+    "Build SMT conditions corresponding to the case(s) jumping to each label."
     assert isinstance(stmt, gcc.GimpleSwitch)
     assert isinstance(stmt.indexvar.type, gcc.IntegerType)
-    target_cond = None
+    label_to_cond = {}
     default_cond = None
     indexvar = get_tree_as_smt(stmt.indexvar, smt_bb)
     for expr in stmt.labels[1:]:
@@ -198,21 +198,24 @@ def build_switch_cond(stmt, label, smt_bb):
         else:
             cond = indexvar == low
 
-        if expr.target == label:
-            if target_cond is None:
-                target_cond = cond
-            else:
-                target_cond = Or(target_cond, cond)
+        label = expr.target
+        if label in label_to_cond:
+            label_to_cond[label] = Or(label_to_cond[label], cond)
+        else:
+            label_to_cond[label] = cond
+
         if default_cond is None:
             default_cond = Not(cond)
         else:
             default_cond = And(default_cond, Not(cond))
 
-    if stmt.labels[0].target == label:
-        if target_cond is not None:
-            return Or(target_cond, default_cond)
-        return default_cond
-    return target_cond
+    default_label = stmt.labels[0].target
+    if default_label in label_to_cond:
+        label_to_cond[default_label] = Or(label_to_cond[default_label], default_cond)
+    else:
+        label_to_cond[default_label] = default_cond
+
+    return label_to_cond
 
 
 def get_smt_sort(type):
@@ -980,11 +983,11 @@ def build_full_edge_cond(edge, smt_fun):
     src_smt_bb = smt_fun.bb2smt[edge.src]
     if len(edge.src.succs) == 1:
         cond = src_smt_bb.is_executed
-    elif src_smt_bb.switch_stmt is not None:
+    elif src_smt_bb.switch_label_to_cond is not None:
         dest_smt_bb = smt_fun.bb2smt[edge.dest]
         cond = None
         for label in dest_smt_bb.labels:
-            label_cond = build_switch_cond(src_smt_bb.switch_stmt, label, dest_smt_bb)
+            label_cond = src_smt_bb.switch_label_to_cond[label]
             if label_cond is not None:
                 if cond is None:
                     cond = label_cond
@@ -1254,8 +1257,8 @@ def process_bb(bb, smt_fun):
             smt_bb.true_bb = true_bb
             smt_bb.false_bb = false_bb
         elif isinstance(stmt, gcc.GimpleSwitch):
-            assert smt_bb.switch_stmt is None
-            smt_bb.switch_stmt = stmt
+            assert smt_bb.switch_label_to_cond is None
+            smt_bb.switch_label_to_cond = build_switch_label_to_cond(stmt, smt_bb)
         elif isinstance(stmt, gcc.GimpleLabel):
             # The label has already been handled when SmtBB was created.
             pass
