@@ -1439,13 +1439,13 @@ def process_function(fun, state, reuse):
     return smt_fun
 
 
-def init_solver(src_smt_fun):
+def init_solver(src_smt_fun, append_ub_check=True):
     solver = Solver()
     if SOLVER_TIMEOUT > 0:
         solver.set("timeout", SOLVER_TIMEOUT * 1000)
     if SOLVER_MAX_MEMORY > 0:
         solver.set("max_memory", SOLVER_MAX_MEMORY)
-    if src_smt_fun.invokes_ub is not None:
+    if append_ub_check and src_smt_fun.invokes_ub is not None:
         solver.append(Not(src_smt_fun.invokes_ub))
     for constraint in src_smt_fun.state.ptr_constraints:
         solver.append(constraint)
@@ -1553,3 +1553,20 @@ def check(
 
     if success and report_success:
         gcc.inform(location, "Transformation seems to be correct.")
+
+
+def find_ub(smt_fun, location, verbose=0):
+    success = True
+    if smt_fun.invokes_ub is not None:
+        solver = init_solver(smt_fun, False)
+        solver.append(smt_fun.invokes_ub)
+        if verbose > 1:
+            print(solver.to_smt2())
+        res = solver.check()
+        if res == sat:
+            msg = f"Invokes UB: {solver.model()}"
+        elif res != unsat:
+            msg = "Analysis timed out."
+        else:
+            msg = "Did not find any UB."
+        gcc.inform(location, msg)
