@@ -89,7 +89,6 @@ Some of the major limitations in the current version:
 * Loops are not implemented.
 * The `CONSTRUCTOR` tree-code is ignored. This is used for brace-enclosed initializers for a structure or an array, which means that the tool will report bogus errors for most programs initializing structures and arrays.
 * Support for memory operations is a bit shaky:
-  * The tool is not tracking uninitialized memory.
   * It is confused about what memory can be pointed to by global pointers.
   * `malloc` etc. are not supported.
   * The tool often reports spurious memory-related errors unless `-fno-strict-aliasing` is passed to the compiler.

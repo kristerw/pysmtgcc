@@ -47,6 +47,7 @@ class CommonState:
         ptr_constraints,
         memory,
         mem_sizes,
+        is_initialized,
         fun_args,
     ):
         self.global_memory = global_memory
@@ -54,6 +55,7 @@ class CommonState:
         self.next_id = next_id
         self.ptr_constraints = ptr_constraints
         self.memory = memory
+        self.is_initialized = is_initialized
         self.mem_sizes = mem_sizes
         self.decl_to_memory = {}
         self.fun_args = fun_args
@@ -91,6 +93,7 @@ class SmtFunction:
         self.fun = fun
         self.name = fun.decl.name
         self.tree_to_smt = {}
+        self.tree_is_initialized = {}
         self.decl_to_id = {}
         self.bb2smt = {}
         self.state = state
@@ -100,6 +103,7 @@ class SmtFunction:
         self.invokes_ub = None
         self.memory = None
         self.mem_sizes = None
+        self.is_initialized = None
 
     def add_ub(self, smt):
         if self.invokes_ub is None:
@@ -109,7 +113,7 @@ class SmtFunction:
 
 
 class SmtBB:
-    def __init__(self, bb, smt_fun, mem_sizes):
+    def __init__(self, bb, smt_fun, mem_sizes, is_initialized):
         self.bb = bb
         self.smt_fun = smt_fun
         self.invokes_ub = None
@@ -122,15 +126,19 @@ class SmtBB:
         if len(bb.preds) == 0:
             self.memory = smt_fun.state.memory
             self.mem_sizes = mem_sizes
+            self.is_initialized = is_initialized
         else:
             memory = []
             mem_sizes = []
+            is_initialized = []
             for edge in bb.preds:
                 src_smt_bb = smt_fun.bb2smt[edge.src]
                 memory.append((src_smt_bb.memory, edge))
                 mem_sizes.append((src_smt_bb.mem_sizes, edge))
+                is_initialized.append((src_smt_bb.is_initialized, edge))
             self.memory = process_phi_smt_args(memory, smt_fun)
             self.mem_sizes = process_phi_smt_args(mem_sizes, smt_fun)
+            self.is_initialized = process_phi_smt_args(is_initialized, smt_fun)
 
         # Create condition telling if this BB is executed or not.
         if len(bb.preds) == 0:
@@ -251,6 +259,7 @@ def load_bytes(mem_id, offset, size, smt_bb):
 
     # Load the "byte" values from memory.
     bytes = []
+    is_initialized = []
     ptr = Concat([mem_id, offset])
     if is_bv_value(mem_id) and is_bv_value(offset):
         ptr = simplify(ptr)
@@ -258,8 +267,8 @@ def load_bytes(mem_id, offset, size, smt_bb):
         p = ptr + i
         if is_bv_value(ptr):
             p = simplify(p)
-        byte_value = Select(smt_bb.memory, p)
-        bytes.insert(0, byte_value)
+        bytes.insert(0, Select(smt_bb.memory, p))
+        is_initialized.append(Select(smt_bb.is_initialized, p))
 
     # Construct a bit-vector for the loaded value.
     if size == 1:
@@ -267,12 +276,12 @@ def load_bytes(mem_id, offset, size, smt_bb):
     else:
         result = Concat(bytes)
 
-    return result
+    return result, is_initialized
 
 
-def load(expr, smt_bb):
+def load_value(expr, smt_bb):
     mem_id, offset = build_smt_addr(expr, smt_bb)
-    result = load_bytes(mem_id, offset, expr.type.sizeof, smt_bb)
+    result, is_initialized = load_bytes(mem_id, offset, expr.type.sizeof, smt_bb)
 
     # Convert the bit-vector to the correct type.
     if isinstance(expr.type, gcc.RealType):
@@ -288,15 +297,36 @@ def load(expr, smt_bb):
     elif not isinstance(expr.type, gcc.IntegerType):
         raise NotImplementedError("load " + str(expr.type.__class__))
 
-    return result
+    return result, is_initialized
 
 
 def load_bitfield(expr, smt_bb):
     assert is_bitfield(expr)
     size = (expr.bitoffset + expr.type.precision + 7) // 8
     mem_id, offset = build_smt_addr(expr, smt_bb)
-    bytes = load_bytes(mem_id, offset, size, smt_bb)
-    return Extract(expr.bitoffset + expr.type.precision - 1, expr.bitoffset, bytes)
+    bytes, is_initialized = load_bytes(mem_id, offset, size, smt_bb)
+    result = Extract(expr.bitoffset + expr.type.precision - 1, expr.bitoffset, bytes)
+    # The value in is_initialized may be of the wrong size; for example, when
+    # loading a 16-bit value (2 bytes) from a misaligned 16-bit bitfield
+    # (3 bytes).
+    if len(is_initialized) == 1:
+        is_init = is_initialized[0]
+    else:
+        is_init = And(is_initialized)
+    is_initialized = [is_init] * ((expr.type.precision + 7) // 8)
+    return result, is_initialized
+
+
+def load(stmt, smt_bb):
+    if isinstance(stmt, gcc.GimpleReturn):
+        expr = stmt.retval
+    else:
+        expr = stmt.rhs[0]
+    if is_bitfield(expr):
+        res, is_initialized = load_bitfield(expr, smt_bb)
+    else:
+        res, is_initialized = load_value(expr, smt_bb)
+    return res, is_initialized
 
 
 def add_out_of_bound_ub_check(mem_id, offset, size, smt_bb):
@@ -324,8 +354,9 @@ def add_out_of_bound_ub_check(mem_id, offset, size, smt_bb):
         smt_bb.add_ub(is_out_of_bound)
 
 
-def store_bytes(mem_id, offset, size, value, smt_bb):
+def store_bytes(mem_id, offset, size, value, is_initialized, smt_bb):
     assert size > 0
+    assert len(is_initialized) == size
     if size > MAX_MEMORY_UNROLL_LIMIT:
         raise NotImplementedError(f"store_bytes too big ({size})")
 
@@ -342,11 +373,12 @@ def store_bytes(mem_id, offset, size, value, smt_bb):
         if is_bv_value(ptr):
             p = simplify(p)
         smt_bb.memory = Store(smt_bb.memory, p, byte_value)
+        smt_bb.is_initialized = Store(smt_bb.is_initialized, p, is_initialized[i])
 
 
-def store(stmt, value, smt_bb):
+def store_value(expr, value, smt_bb):
     # Create a bit-vector for the value to store.
-    type = stmt.lhs.type
+    type = expr.type
     if isinstance(type, gcc.RealType):
         value = fpToIEEEBV(value)
         if type.precision == 80:
@@ -360,8 +392,12 @@ def store(stmt, value, smt_bb):
     elif not isinstance(type, gcc.IntegerType):
         raise NotImplementedError("store " + str(type.__class__))
 
-    mem_id, offset = build_smt_addr(stmt.lhs, smt_bb)
-    store_bytes(mem_id, offset, type.sizeof, value, smt_bb)
+    mem_id, offset = build_smt_addr(expr, smt_bb)
+    if expr in smt_bb.smt_fun.tree_is_initialized:
+        is_initialized = smt_bb.smt_fun.tree_is_initialized[expr]
+    else:
+        is_initialized = [BoolVal(True)] * type.sizeof
+    store_bytes(mem_id, offset, type.sizeof, value, is_initialized, smt_bb)
 
 
 def store_bitfield(expr, value, smt_bb):
@@ -369,7 +405,7 @@ def store_bitfield(expr, value, smt_bb):
     mem_id, offset = build_smt_addr(expr, smt_bb)
 
     size = (expr.bitoffset + expr.type.precision + 7) // 8
-    result = load_bytes(mem_id, offset, size, smt_bb)
+    result, _ = load_bytes(mem_id, offset, size, smt_bb)
     parts = []
     if expr.bitoffset + expr.type.precision != size * 8:
         nof_bits = size * 8
@@ -384,7 +420,47 @@ def store_bitfield(expr, value, smt_bb):
     else:
         value = Concat(parts)
 
-    store_bytes(mem_id, offset, size, value, smt_bb)
+    if expr in smt_bb.smt_fun.tree_is_initialized:
+        # The value store in tree_is_initialized may be of the wrong size;
+        # for example, when storing a 16-bit value (2 bytes) in a misaligned
+        # 16-bit bitfield (3 bytes).
+        if len(is_initialized) == 1:
+            is_init = is_initialized[0]
+        else:
+            is_init = And(is_initialized)
+        is_initialized = [is_init] * size
+    else:
+        is_initialized = [BoolVal(True)] * size
+    store_bytes(mem_id, offset, size, value, is_initialized, smt_bb)
+
+
+def store(stmt, smt_bb):
+    if stmt.exprcode == gcc.Constructor:
+        if not (stmt.rhs[0].is_clobber or len(stmt.rhs[0].elements) == 0):
+            raise NotImplementedError("store constructor that is not a clobber")
+        size = stmt.rhs[0].type.sizeof
+        if size == 0:
+            # This happens for {CLOBBER(eol) constructors for zero
+            # sized arrays such as "int x[0];".
+            return
+        if size > MAX_MEMORY_UNROLL_LIMIT:
+            raise NotImplementedError(f"store large constructor ({size} bytes)")
+        mem_id, smt_offset = build_smt_addr(stmt.lhs, smt_bb)
+        if stmt.rhs[0].is_clobber:
+            smt_bb.is_initialized = mark_mem_uninitialized(
+                mem_id, smt_offset, size, smt_bb.is_initialized
+            )
+        else:
+            is_initialized = [BoolVal(True)] * size
+            rhs = BitVecVal(0, size * 8)
+            store_bytes(mem_id, smt_offset, size, rhs, is_initialized, smt_bb)
+        return
+
+    value = process_unary(stmt, smt_bb, False)
+    if is_bitfield(stmt.lhs):
+        store_bitfield(stmt.lhs, value, smt_bb)
+    else:
+        store_value(stmt.lhs, value, smt_bb)
 
 
 def has_loop(fun):
@@ -411,7 +487,15 @@ def uninit_var_to_smt(expr):
     return Const(name, get_smt_sort(expr.type))
 
 
-def get_tree_as_smt(expr, smt_bb):
+def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
+    if uninit_is_ub and expr in smt_bb.smt_fun.tree_is_initialized:
+        is_initialized = smt_bb.smt_fun.tree_is_initialized[expr]
+        if len(is_initialized) == 1:
+            is_uninitialized = Not(is_initialized[0])
+        else:
+            is_uninitialized = Not(And(is_initialized))
+        smt_bb.add_ub(is_uninitialized)
+
     if isinstance(expr, gcc.ParmDecl):
         return smt_bb.smt_fun.tree_to_smt[expr]
     if isinstance(expr, gcc.SsaName):
@@ -421,10 +505,13 @@ def get_tree_as_smt(expr, smt_bb):
             return smt_bb.smt_fun.tree_to_smt[expr.var]
         if isinstance(expr.var, gcc.VarDecl):
             # We are reading from an uninitialized local variable.
-            # Make execution of this BB as UB, and create a new
-            # unconstrained constant to make the generated SMT
-            # typecheck.
-            smt_bb.add_ub(BoolVal(True))
+            # Mark this as uninitialized, and create a new unconstrained
+            # constant to make the generated SMT typecheck.
+            if uninit_is_ub:
+                smt_bb.add_ub(BoolVal(True))
+            else:
+                is_initialized = [BoolVal(False)] * expr.var.type.sizeof
+                smt_bb.smt_fun.tree_is_initialized[expr] = is_initialized
             return uninit_var_to_smt(expr)
         raise NotImplementedError(f"get_tree_as_smt SsaName {expr}")
     if isinstance(expr, gcc.IntegerCst):
@@ -438,17 +525,15 @@ def get_tree_as_smt(expr, smt_bb):
             offset = Extract(PTR_OFFSET_BITS - 1, 0, cst)
             return SmtPointer(mem_id, offset)
     if isinstance(expr, gcc.ViewConvertExpr):
-        value = get_tree_as_smt(expr.operand, smt_bb)
+        # Ignore uninit_is_ub as we are doing an operation on the value,
+        # which is UB if iti is uninitialized.
+        value = get_tree_as_smt(expr.operand, smt_bb, True)
         return bit_cast(value, expr.operand.type, expr.type)
     if isinstance(expr, gcc.RealCst):
         return FPVal(expr.constant, get_smt_sort(expr.type))
     if isinstance(expr, gcc.AddrExpr):
         mem_id, offset = build_smt_addr(expr.operand, smt_bb)
         return SmtPointer(mem_id, offset)
-    if isinstance(expr, (gcc.VarDecl, gcc.ArrayRef, gcc.ComponentRef, gcc.MemRef)):
-        if is_bitfield(expr):
-            return load_bitfield(expr, smt_bb)
-        return load(expr, smt_bb)
 
     raise NotImplementedError(f"get_tree_as_smt {expr.__class__} {expr.type.__class__}")
 
@@ -882,10 +967,38 @@ def convert_to_float(value, src_type, dest_type):
     raise NotImplementedError(f"convert_to_float {src_type.__class__}")
 
 
-def process_unary(stmt, smt_bb):
+def process_unary(stmt, smt_bb, uninit_is_ub=True):
     assert len(stmt.rhs) == 1
 
-    rhs = get_tree_as_smt(stmt.rhs[0], smt_bb)
+    if isinstance(
+        stmt.rhs[0], (gcc.VarDecl, gcc.ArrayRef, gcc.ComponentRef, gcc.MemRef)
+    ):
+        res, is_initialized = load(stmt, smt_bb)
+        if isinstance(stmt.lhs, gcc.SsaName):
+            smt_bb.smt_fun.tree_is_initialized[stmt.lhs] = is_initialized
+        return res
+
+    # We want to treat load of an uninitialized local value in the same
+    # way as read of an uninitialized global value. But uninitialized
+    # local values are encoded as gcc.SsaName, so we need to disable the
+    # check for undefined value in get_tree_as_smt and do the check here
+    # when we know if the value is just placed in a new gcc.SsaName (which
+    # is allowed) or used in an operation (which is UB).
+    rhs = get_tree_as_smt(stmt.rhs[0], smt_bb, False)
+    if stmt.exprcode == gcc.SsaName:
+        if stmt.rhs[0] in smt_bb.smt_fun.tree_is_initialized:
+            is_initialized = smt_bb.smt_fun.tree_is_initialized[stmt.rhs[0]]
+            smt_bb.smt_fun.tree_is_initialized[stmt.lhs] = is_initialized
+        return rhs
+
+    if uninit_is_ub and stmt.rhs[0] in smt_bb.smt_fun.tree_is_initialized:
+        is_initialized = smt_bb.smt_fun.tree_is_initialized[stmt.rhs[0]]
+        if len(is_initialized) == 1:
+            is_uninitialized = Not(is_initialized[0])
+        else:
+            is_uninitialized = Not(And(is_initialized))
+        smt_bb.add_ub(is_uninitialized)
+
     if stmt.exprcode == gcc.NopExpr:
         src_type = stmt.rhs[0].type
         dest_type = stmt.lhs.type
@@ -950,13 +1063,8 @@ def process_unary(stmt, smt_bb):
         return rhs
     elif stmt.exprcode in [
         gcc.ParmDecl,
-        gcc.SsaName,
         gcc.IntegerCst,
         gcc.RealCst,
-        gcc.VarDecl,
-        gcc.ArrayRef,
-        gcc.ComponentRef,
-        gcc.MemRef,
         gcc.AddrExpr,
     ]:
         return rhs
@@ -1080,8 +1188,11 @@ def process_GimpleCall(stmt, smt_bb):
             size = int(str(size))
             if size < MAX_MEMORY_UNROLL_LIMIT:
                 val = Extract(7, 0, val)
+                is_initialized = [BoolVal(True)]
                 for i in range(0, size):
-                    store_bytes(ptr.mem_id, ptr.offset + i, 1, val, smt_bb)
+                    store_bytes(
+                        ptr.mem_id, ptr.offset + i, 1, val, is_initialized, smt_bb
+                    )
                 return
     if stmt.fndecl.name in [
         "__builtin_bswap16",
@@ -1174,29 +1285,11 @@ def build_smt_addr(expr, smt_bb):
 
 
 def process_GimpleAssign(stmt, smt_bb):
-    if stmt.exprcode == gcc.Constructor:
-        # The python plugin does not return correct constructor
-        # objects -- the list of values is always empty. Fill the
-        # memory with 0 for now. This is wrong, but does not seem
-        # to give us too much problems (as the tests using
-        # constructors in most cases have function calls etc.)
-        #
-        # TODO: Implement gcc.Constructor in the python plugin.
-        bit_size = stmt.rhs[0].type.sizeof * 8
-        if bit_size == 0:
-            # This happens for {CLOBBER(eol) constructors for zero
-            # sized arrays such as "int x[0];".
-            rhs = None
-        else:
-            # Arbitrarily limit large arrays -- checking will be slow, and
-            # the gcc.Constructor implementation is not correct anyway,
-            # so we may as well just report an error.
-            if bit_size > 8000:
-                raise NotImplementedError(
-                    f"process_GimpleAssign large constructor ({bit_size // 8} bytes)"
-                )
-            rhs = BitVecVal(0, bit_size)
-    elif len(stmt.rhs) == 1:
+    if not isinstance(stmt.lhs, gcc.SsaName):
+        store(stmt, smt_bb)
+        return
+
+    if len(stmt.rhs) == 1:
         rhs = process_unary(stmt, smt_bb)
     elif len(stmt.rhs) == 3:
         rhs = process_ternary(stmt, smt_bb)
@@ -1212,16 +1305,7 @@ def process_GimpleAssign(stmt, smt_bb):
         raise NotImplementedError(
             f"process_GimpleAssign {stmt.exprcode} {stmt.lhs.type.__class__}", stmt.loc
         )
-
-    if isinstance(stmt.lhs, gcc.SsaName):
-        smt_bb.smt_fun.tree_to_smt[stmt.lhs] = rhs
-    elif stmt.exprcode == gcc.Constructor:
-        mem_id, smt_offset = build_smt_addr(stmt.lhs, smt_bb)
-        store_bytes(mem_id, smt_offset, stmt.rhs[0].type.sizeof, rhs, smt_bb)
-    elif is_bitfield(stmt.lhs):
-        store_bitfield(stmt.lhs, rhs, smt_bb)
-    else:
-        store(stmt, rhs, smt_bb)
+    smt_bb.smt_fun.tree_to_smt[stmt.lhs] = rhs
 
 
 def process_bb(bb, smt_fun):
@@ -1240,7 +1324,18 @@ def process_bb(bb, smt_fun):
             # without providing a value (this is allowed in C as long
             # as the caller does not use the returned value).
             if stmt.retval is not None:
-                retval = get_tree_as_smt(stmt.retval, smt_bb)
+                if isinstance(
+                    stmt.retval,
+                    (gcc.VarDecl, gcc.ArrayRef, gcc.ComponentRef, gcc.MemRef),
+                ):
+                    retval, is_initialized = load(stmt, smt_bb)
+                    if len(is_initialized) == 1:
+                        is_uninitialized = Not(is_initialized[0])
+                    else:
+                        is_uninitialized = Not(And(is_initialized))
+                    smt_bb.add_ub(is_uninitialized)
+                else:
+                    retval = get_tree_as_smt(stmt.retval, smt_bb)
                 if isinstance(retval, SmtPointer):
                     retval = retval.bitvector()
                 smt_bb.retval = retval
@@ -1274,6 +1369,12 @@ def process_bb(bb, smt_fun):
 
 
 def init_common_state(fun):
+    memory = Array(".memory", BitVecSort(64), BitVecSort(8))
+    # We must treat arbitrarily global memory as initialized (as we
+    # cannot see if/what other functions has written), so let "true"
+    # be the default value.
+    is_initialized = K(BitVecSort(64), BoolVal(True))
+
     next_id = 1
     memory_objects = []
     mem_sizes = K(BitVecSort(PTR_ID_BITS), BitVecVal(0, PTR_OFFSET_BITS))
@@ -1323,9 +1424,14 @@ def init_common_state(fun):
         smt_size = Select(mem_sizes, mem_id)
         ptr_constraints.append(And(ptr.offset >= 0, ptr.offset < smt_size))
 
-    memory = Array(".memory", BitVecSort(64), BitVecSort(8))
     return CommonState(
-        memory_objects, next_id, ptr_constraints, memory, mem_sizes, fun_args
+        memory_objects,
+        next_id,
+        ptr_constraints,
+        memory,
+        mem_sizes,
+        is_initialized,
+        fun_args,
     )
 
 
@@ -1342,6 +1448,20 @@ def find_unimplemented(fun):
                     raise NotImplementedError("GimpleCall", stmt.loc)
                 if not stmt.fndecl.name.startswith("__builtin"):
                     raise NotImplementedError("GimpleCall", stmt.loc)
+
+
+def mark_mem_uninitialized(mem_id, offset, size, is_initialized):
+    if size > MAX_MEMORY_UNROLL_LIMIT:
+        raise NotImplementedError(f"mark_mem_uninitialized too big ({size})")
+    ptr = Concat([mem_id, offset])
+    if is_bv_value(mem_id) and is_bv_value(offset):
+        ptr = simplify(ptr)
+    for i in range(0, size):
+        p = ptr + i
+        if is_bv_value(ptr):
+            p = simplify(p)
+        is_initialized = Store(is_initialized, p, BoolVal(False))
+    return is_initialized
 
 
 def process_function(fun, state, reuse):
@@ -1370,6 +1490,7 @@ def process_function(fun, state, reuse):
             smt_fun.tree_to_smt[arg] = smt_arg[0]
 
     mem_sizes = state.mem_sizes
+    is_initialized = state.is_initialized
     next_id = state.next_id
     memory_objects = state.global_memory[:]
     if reuse:
@@ -1386,17 +1507,20 @@ def process_function(fun, state, reuse):
             continue
 
         if reuse and decl in state.decl_to_memory:
-            continue
-
-        size = decl.type.sizeof
-        memory_object = MemoryBlock(decl, size, next_id)
-        local_memory.append(memory_object)
-        state.decl_to_memory[decl] = memory_object
-        next_id = next_id + 1
-        memory_objects.append(memory_object)
-
-        mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
-        mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+            memory_object = state.decl_to_memory[decl]
+            size = memory_object.size
+            mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
+        else:
+            size = decl.type.sizeof
+            memory_object = MemoryBlock(decl, size, next_id)
+            local_memory.append(memory_object)
+            state.decl_to_memory[decl] = memory_object
+            next_id = next_id + 1
+            memory_objects.append(memory_object)
+            mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
+            mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+        offset = BitVecVal(0, PTR_OFFSET_BITS)
+        is_initialized = mark_mem_uninitialized(mem_id, offset, size, is_initialized)
 
     state.next_id = next_id
     if not reuse:
@@ -1406,7 +1530,7 @@ def process_function(fun, state, reuse):
         smt_fun.decl_to_id[obj.decl] = BitVecVal(obj.mem_id, PTR_ID_BITS)
 
     for bb in fun.cfg.inverted_post_order:
-        SmtBB(bb, smt_fun, mem_sizes)
+        SmtBB(bb, smt_fun, mem_sizes, is_initialized)
         process_bb(bb, smt_fun)
 
     if not isinstance(fun.decl.result.type, gcc.VoidType):
@@ -1430,6 +1554,7 @@ def process_function(fun, state, reuse):
     exit_smt_bb = smt_fun.bb2smt[fun.cfg.exit]
     smt_fun.memory = exit_smt_bb.memory
     smt_fun.mem_sizes = exit_smt_bb.mem_sizes
+    smt_fun.is_initialized = exit_smt_bb.is_initialized
 
     for bb in fun.cfg.inverted_post_order:
         smt_bb = smt_fun.bb2smt[bb]
