@@ -421,6 +421,7 @@ def store_bitfield(expr, value, smt_bb):
         value = Concat(parts)
 
     if expr in smt_bb.smt_fun.tree_is_initialized:
+        is_initialized = smt_bb.smt_fun.tree_is_initialized[expr]
         # The value store in tree_is_initialized may be of the wrong size;
         # for example, when storing a 16-bit value (2 bytes) in a misaligned
         # 16-bit bitfield (3 bytes).
