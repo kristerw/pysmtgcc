@@ -87,7 +87,6 @@ and gives us an example of input where this happen (the values are, unfortunatel
 Some of the major limitations in the current version:
 * Function calls are not implemented.
 * Loops are not implemented.
-* The `CONSTRUCTOR` tree-code is ignored. This is used for brace-enclosed initializers for a structure or an array, which means that the tool will report bogus errors for most programs initializing structures and arrays.
 * Support for memory operations is a bit shaky:
   * It is confused about what memory can be pointed to by global pointers.
   * `malloc` etc. are not supported.

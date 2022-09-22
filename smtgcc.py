@@ -1369,6 +1369,75 @@ def process_bb(bb, smt_fun):
             raise NotImplementedError(f"process_bb {stmt.__class__}", stmt.loc)
 
 
+def is_const(type):
+    if isinstance(type, gcc.ArrayType):
+        # gcc.ArrayType does not have a const qualifier, so we need to
+        # check the element type (and recursively so that we handle
+        # arrays of arrays.
+        return is_const(type.dereference)
+    return type.const
+
+
+def init_bytes(mem_id, offset, size, value, memory, is_initialized):
+    ptr = Concat([mem_id, offset])
+    if is_bv_value(mem_id) and is_bv_value(offset):
+        ptr = simplify(ptr)
+    for i in range(0, size):
+        byte_value = Extract(i * 8 + 7, i * 8, value)
+        if is_bv_value(value):
+            byte_value = simplify(byte_value)
+        p = ptr + i
+        if is_bv_value(ptr):
+            p = simplify(p)
+        memory = Store(memory, p, byte_value)
+        is_initialized = Store(is_initialized, p, BoolVal(True))
+    return memory, is_initialized
+
+
+def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
+    assert isinstance(decl, gcc.VarDecl)
+    if isinstance(decl.initial.type, gcc.IntegerType):
+        assert isinstance(decl.initial, gcc.IntegerCst)
+        assert size == decl.initial.type.precision // 8
+        value = BitVecVal(decl.initial.constant, decl.initial.type.precision)
+        offset = BitVecVal(0, PTR_OFFSET_BITS)
+        return init_bytes(mem_id, offset, size, value, memory, is_initialized)
+    if isinstance(decl.initial.type, (gcc.ArrayType, gcc.RecordType)):
+        if decl.initial.is_clobber:
+            is_initialized = mark_mem_uninitialized(
+                mem_id, offset, size, is_initialized
+            )
+        if not decl.initial.no_clearing:
+            # Note: It is enough to only update memory as is_initialized
+            # already is true per default for global memory.
+            ptr = simplify(Concat([mem_id, BitVecVal(0, PTR_OFFSET_BITS)]))
+            for i in range(0, size):
+                p = simplify(ptr + i)
+                memory = Store(memory, p, BitVecVal(0, 8))
+        for elem in decl.initial.elements:
+            if isinstance(decl.initial.type, gcc.ArrayType):
+                assert isinstance(elem[0], gcc.IntegerCst)
+                elem_size = decl.initial.type.dereference.sizeof
+                index = elem[0].constant
+                offset = BitVecVal(index * elem_size, PTR_OFFSET_BITS)
+            else:
+                assert isinstance(elem[0], gcc.FieldDecl)
+                if elem[0].bitoffset % 8 != 0 or elem[0].type.precision % 8 != 0:
+                    raise NotImplementedError(f"init_global_var_decl bitfield")
+                offset = BitVecVal(elem[0].offset, PTR_OFFSET_BITS)
+            if not isinstance(elem[1].type, gcc.IntegerType):
+                raise NotImplementedError(
+                    f"init_global_var_decl {elem[1].type.__class__}"
+                )
+            value = BitVecVal(elem[1].constant, elem[1].type.precision)
+            size = elem[1].type.precision // 8
+            memory, is_initialized = init_bytes(
+                mem_id, offset, size, value, memory, is_initialized
+            )
+        return memory, is_initialized
+    raise NotImplementedError(f"init_global_var_decl {decl.initial.type.__class__}")
+
+
 def init_common_state(fun):
     memory = Array(".memory", BitVecSort(64), BitVecSort(8))
     # We must treat arbitrarily global memory as initialized (as we
@@ -1392,6 +1461,14 @@ def init_common_state(fun):
 
         mem_id = BitVecVal(next_id, PTR_ID_BITS)
         mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+
+        # We should not initialize non-const memory -- it can be modified
+        # before the functions are called, so functions should work with
+        # any value.
+        if is_const(var.decl.type):
+            memory, is_initialized = init_global_var_decl(
+                var.decl, mem_id, size, memory, is_initialized
+            )
 
         next_id = next_id + 1
 
