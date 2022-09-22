@@ -404,6 +404,10 @@ def store_bitfield(expr, value, smt_bb):
     assert is_bitfield(expr)
     mem_id, offset = build_smt_addr(expr, smt_bb)
 
+    if is_bool(value):
+        assert expr.type.precision == 1
+        value = If(value, BitVecVal(1, 1), BitVecVal(0, 1))
+
     size = (expr.bitoffset + expr.type.precision + 7) // 8
     result, _ = load_bytes(mem_id, offset, size, smt_bb)
     parts = []
