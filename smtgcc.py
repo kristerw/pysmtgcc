@@ -1143,27 +1143,27 @@ def process_phi_smt_args(args, smt_fun):
     return res
 
 
-def process_phi(args, smt_bb):
+def process_phi(args, smt_bb, lhs=None):
     smt_args = []
+    is_init = []
+    need_uninit_check = False
     for expr, edge in args:
-        if (
-            isinstance(expr, gcc.SsaName)
-            and expr not in smt_bb.smt_fun.tree_to_smt
-            and not isinstance(expr.var, gcc.ParmDecl)
-            and isinstance(expr.var, gcc.VarDecl)
-        ):
-            # We are reading from an uninitialized local variable.
-            # Make execution of this edge as UB, and create a new
-            # unconstrained constant to make the generated SMT
-            # typecheck.
-            # Note: This is normally done in get_tree_as_smt, but
-            # we cannot call it here as we only want UB when the
-            # execution followed this edge.
-            smt_bb.add_ub(build_full_edge_cond(edge, smt_bb.smt_fun))
-            value = uninit_var_to_smt(expr)
+        value = get_tree_as_smt(expr, smt_bb, False)
+        if expr in smt_bb.smt_fun.tree_is_initialized:
+            is_initialized = smt_bb.smt_fun.tree_is_initialized[expr]
+            need_uninit_check = True
         else:
-            value = get_tree_as_smt(expr, smt_bb)
+            is_initialized = [BoolVal(True)] * expr.type.sizeof
         smt_args.append((value, edge))
+        is_init.append((is_initialized, edge))
+    if need_uninit_check and lhs is not None:
+        is_initialized = []
+        for i in range(0, expr.type.sizeof):
+            is_init2 = []
+            for initialized, edge in is_init:
+                is_init2.append((initialized[i], edge))
+            is_initialized.append(process_phi_smt_args(is_init2, smt_bb.smt_fun))
+        smt_bb.smt_fun.tree_is_initialized[lhs] = is_initialized
     return process_phi_smt_args(smt_args, smt_bb.smt_fun)
 
 
@@ -1314,7 +1314,7 @@ def process_bb(bb, smt_fun):
         if isinstance(phi.lhs.type, gcc.VoidType):
             # Skip phi nodes for the memory SSA virtual SSA names.
             continue
-        smt_fun.tree_to_smt[phi.lhs] = process_phi(phi.args, smt_bb)
+        smt_fun.tree_to_smt[phi.lhs] = process_phi(phi.args, smt_bb, phi.lhs)
 
     for stmt in bb.gimple:
         if isinstance(stmt, gcc.GimpleAssign):
