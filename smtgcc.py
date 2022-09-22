@@ -507,6 +507,12 @@ def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
         if expr in smt_bb.smt_fun.tree_to_smt:
             return smt_bb.smt_fun.tree_to_smt[expr]
         if isinstance(expr.var, gcc.ParmDecl):
+            if (
+                expr.var not in smt_bb.smt_fun.tree_to_smt
+                and expr.var.is_artificial
+                and expr.var.name[:5] == "CHAIN"
+            ):
+                raise NotImplementedError(f"get_tree_as_smt nested functions")
             return smt_bb.smt_fun.tree_to_smt[expr.var]
         if isinstance(expr.var, gcc.VarDecl):
             # We are reading from an uninitialized local variable.
