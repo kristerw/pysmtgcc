@@ -1418,6 +1418,10 @@ def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
         offset = BitVecVal(0, PTR_OFFSET_BITS)
         return init_bytes(mem_id, offset, size, value, memory, is_initialized)
     if isinstance(decl.initial.type, (gcc.ArrayType, gcc.RecordType)):
+        if not isinstance(decl.initial, gcc.Constructor):
+            raise NotImplementedError(
+                f"init_global_var_decl {decl.initial.__class__} instead of gcc.Constructor"
+            )
         if decl.initial.is_clobber:
             is_initialized = mark_mem_uninitialized(
                 mem_id, offset, size, is_initialized
