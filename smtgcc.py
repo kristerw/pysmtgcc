@@ -43,6 +43,7 @@ class CommonState:
     def __init__(
         self,
         global_memory,
+        const_mem_ids,
         next_id,
         ptr_constraints,
         memory,
@@ -51,6 +52,7 @@ class CommonState:
         fun_args,
     ):
         self.global_memory = global_memory
+        self.const_mem_ids = const_mem_ids
         self.local_memory = None
         self.next_id = next_id
         self.ptr_constraints = ptr_constraints
@@ -255,7 +257,7 @@ def load_bytes(mem_id, offset, size, smt_bb):
     if size > MAX_MEMORY_UNROLL_LIMIT:
         raise NotImplementedError(f"load_bytes too big ({size})")
 
-    add_out_of_bound_ub_check(mem_id, offset, size, smt_bb)
+    out_of_bound_ub_check(mem_id, offset, size, smt_bb)
 
     # Load the "byte" values from memory.
     bytes = []
@@ -329,7 +331,7 @@ def load(stmt, smt_bb):
     return res, is_initialized
 
 
-def add_out_of_bound_ub_check(mem_id, offset, size, smt_bb):
+def out_of_bound_ub_check(mem_id, offset, size, smt_bb):
     is_valid_mem_id = UGE(mem_id, smt_bb.smt_fun.state.next_id)
     if is_bv_value(mem_id):
         is_valid_mem_id = simplify(is_valid_mem_id)
@@ -354,13 +356,25 @@ def add_out_of_bound_ub_check(mem_id, offset, size, smt_bb):
         smt_bb.add_ub(is_out_of_bound)
 
 
+def const_mem_ub_check(mem_id, smt_bb):
+    const_mem_ids = smt_bb.smt_fun.state.const_mem_ids
+    if const_mem_ids:
+        is_ub = mem_id == const_mem_ids[0]
+        for cmem_id in const_mem_ids[1:]:
+            is_ub = Or(is_ub, mem_id == cmem_id)
+        if is_bv_value(mem_id):
+            is_ub = simplify(is_ub)
+        smt_bb.add_ub(is_ub)
+
+
 def store_bytes(mem_id, offset, size, value, is_initialized, smt_bb):
     assert size > 0
     assert len(is_initialized) == size
     if size > MAX_MEMORY_UNROLL_LIMIT:
         raise NotImplementedError(f"store_bytes too big ({size})")
 
-    add_out_of_bound_ub_check(mem_id, offset, size, smt_bb)
+    out_of_bound_ub_check(mem_id, offset, size, smt_bb)
+    const_mem_ub_check(mem_id, smt_bb)
 
     ptr = Concat([mem_id, offset])
     if is_bv_value(mem_id) and is_bv_value(offset):
@@ -1467,6 +1481,7 @@ def init_common_state(fun):
     next_id = 1
     memory_objects = []
     mem_sizes = K(BitVecSort(PTR_ID_BITS), BitVecVal(0, PTR_OFFSET_BITS))
+    const_mem_ids = []
     for var in gcc.get_variables():
         if isinstance(var.decl.type, gcc.ArrayType) and not isinstance(
             var.decl.type.range, gcc.IntegerType
@@ -1485,9 +1500,11 @@ def init_common_state(fun):
         # before the functions are called, so functions should work with
         # any value.
         if is_const(var.decl.type):
-            memory, is_initialized = init_global_var_decl(
-                var.decl, mem_id, size, memory, is_initialized
-            )
+            const_mem_ids.append(mem_id)
+            if var.decl.initial is not None:
+                memory, is_initialized = init_global_var_decl(
+                    var.decl, mem_id, size, memory, is_initialized
+                )
 
         next_id = next_id + 1
 
@@ -1523,6 +1540,7 @@ def init_common_state(fun):
 
     return CommonState(
         memory_objects,
+        const_mem_ids,
         next_id,
         ptr_constraints,
         memory,
