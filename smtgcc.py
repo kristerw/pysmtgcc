@@ -1380,6 +1380,11 @@ def process_bb(bb, smt_fun):
 
 
 def is_const(type):
+    if isinstance(type, gcc.PointerType):
+        # gcc.PointerType does not have any .const attribute, so assume
+        # it is not a constant.
+        # TODO: Add support to the Python plugin.
+        return False
     if isinstance(type, gcc.ArrayType):
         # gcc.ArrayType does not have a const qualifier, so we need to
         # check the element type (and recursively so that we handle
