@@ -1120,6 +1120,10 @@ def build_full_edge_cond(edge, smt_fun):
         dest_smt_bb = smt_fun.bb2smt[edge.dest]
         cond = None
         for label in dest_smt_bb.labels:
+            if label not in src_smt_bb.switch_label_to_cond:
+                # The destination BB may have additional labels not
+                # used by the switch statement. Ignore them.
+                continue
             label_cond = src_smt_bb.switch_label_to_cond[label]
             if label_cond is not None:
                 if cond is None:
