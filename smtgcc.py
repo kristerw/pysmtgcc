@@ -1467,6 +1467,10 @@ def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
                 offset = BitVecVal(index * elem_size, PTR_OFFSET_BITS)
             else:
                 assert isinstance(elem[0], gcc.FieldDecl)
+                if not isinstance(elem[0].type, gcc.IntegerType):
+                    raise NotImplementedError(
+                        f"init_global_var_decl {elem[0].type.__class__}"
+                    )
                 if elem[0].bitoffset % 8 != 0 or elem[0].type.precision % 8 != 0:
                     raise NotImplementedError(f"init_global_var_decl bitfield")
                 offset = BitVecVal(elem[0].offset, PTR_OFFSET_BITS)
