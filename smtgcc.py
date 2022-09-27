@@ -1397,7 +1397,7 @@ def process_bb(bb, smt_fun):
             raise NotImplementedError(f"process_bb {stmt.__class__}", stmt.loc)
 
 
-def is_const(type):
+def is_const_type(type):
     if isinstance(type, (gcc.PointerType, gcc.UnionType)):
         # gcc.PointerType etc. does not have any .const attribute, so assume
         # it is not a constant.
@@ -1407,8 +1407,16 @@ def is_const(type):
         # gcc.ArrayType does not have a const qualifier, so we need to
         # check the element type (and recursively so that we handle
         # arrays of arrays.
-        return is_const(type.dereference)
+        return is_const_type(type.dereference)
     return type.const
+
+
+def is_const(expr):
+    # There are two ways to say that an array is constant:
+    # * Make the elements of a const type (this is how the C frontend does it).
+    # * Set the TREE_CONSTANT flag on the decl (this is how the switchconv
+    #   pass does it for the CSWTCH arrays it creates).
+    return expr.is_constant or is_const_type(expr.type)
 
 
 def init_bytes(mem_id, offset, size, value, memory, is_initialized):
@@ -1503,7 +1511,7 @@ def init_common_state(fun):
         # We should not initialize non-const memory -- it can be modified
         # before the functions are called, so functions should work with
         # any value.
-        if is_const(var.decl.type):
+        if is_const(var.decl):
             const_mem_ids.append(mem_id)
             if var.decl.initial is not None:
                 memory, is_initialized = init_global_var_decl(
@@ -1612,12 +1620,40 @@ def process_function(fun, state, reuse):
     is_initialized = state.is_initialized
     next_id = state.next_id
     memory_objects = state.global_memory[:]
+    for obj in memory_objects:
+        smt_fun.decl_to_id[obj.decl] = BitVecVal(obj.mem_id, PTR_ID_BITS)
     if reuse:
         for memory_object in state.local_memory:
             memory_objects.append(memory_object)
             size = memory_object.size
             mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
             mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+
+    # Some passes (such as switchconv) may add new global variables, so we
+    # need to add global variables not present in the common state.
+    for var in gcc.get_variables():
+        if var.decl not in smt_fun.decl_to_id:
+            if isinstance(var.decl.type, gcc.ArrayType) and not isinstance(
+                var.decl.type.range, gcc.IntegerType
+            ):
+                # This is an array declared without size. Invent a size...
+                size = ANON_MEM_SIZE
+            else:
+                size = var.decl.type.sizeof
+            memory_object = MemoryBlock(var.decl, size, next_id)
+            memory_objects.append(memory_object)
+            mem_id = BitVecVal(next_id, PTR_ID_BITS)
+            mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+            # We should not initialize non-const memory -- it can be modified
+            # before the functions are called, so functions should work with
+            # any value.
+            if is_const(var.decl):
+                state.const_mem_ids.append(mem_id)
+                if var.decl.initial is not None:
+                    state.memory, state.is_initialized = init_global_var_decl(
+                        var.decl, mem_id, size, state.memory, state.is_initialized
+                    )
+            next_id = next_id + 1
 
     local_memory = []
     for decl in smt_fun.fun.local_decls:
