@@ -81,7 +81,26 @@ example.c:6:5: note: [c = 1793412222, a = 3429154139, b = 2508144171]
 telling us that `tgt` invokes undefined behavior in cases where `src` does not,
 and gives us an example of input where this happen (the values are, unfortunately, written as unsigned values. In this case, it means `[c = 1793412222, a = -865813157, b = -1786823125]`).
 
-**Note**: `plugin2.py` works on the IR from the `ssa` pass, i.e., early enough that the compiler has not done many optimizations. But GCC does peephole optimizations earlier (even when compiling as `-O0`), so you cannot use this plugin to test such optimizations. It is good practice to check with `-fdump-tree-ssa` that the IR used by the tool looks as expected.
+**Note**: `plugin2.py` works on the IR from the `ssa` pass, i.e., early enough that the compiler has not done many optimizations. But GCC does peephole optimizations earlier (even when compiling as `-O0`), so we need to prevent that from happening when testing such optimizations. The pre-GIMPLE optimizations are done one statement at a time, so we can disable the optimization by splitting the optimized pattern into two statements. For example, to check the following optimization
+```
+-(a - b)  ->  b - a
+```
+we can write the test as
+```
+int src(int a, int b)
+{
+  int t = a - b;
+  return -t;
+}
+
+int tgt(int a, int b)
+{
+  return b - a;
+}
+```
+Another way to verify such optimizations is to write the test in GIMPLE and pass the `-fgimple` flag to the compiler.
+
+It is good practice to check with `-fdump-tree-ssa` that the IR used by the tool looks as expected. 
 
 # Limitations
 Some of the major limitations in the current version:
