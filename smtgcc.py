@@ -1279,6 +1279,9 @@ def process_ArrayRef(array_ref, smt_bb):
                 index = ZeroExt(64 - precision, index)
             else:
                 index = SignExt(64 - precision, index)
+        elif precision > 64:
+            smt_bb.add_ub(UGE(index, (1 << 64)))
+            index = Extract(63, 0, index)
         offset = BitVecVal(elem_size, 64) * index
         if array_ref.array.type.range is None:
             eindex = ZeroExt(64, index)
