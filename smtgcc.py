@@ -1181,18 +1181,23 @@ def process_phi(args, smt_bb, lhs=None):
     smt_args = []
     is_init = []
     need_uninit_check = False
+    type = args[0][0].type
+    if isinstance(type, gcc.IntegerType) and type.sizeof * 8 != type.precision:
+        sizeof = (type.precision + 7) // 8
+    else:
+        sizeof = type.sizeof
     for expr, edge in args:
         value = get_tree_as_smt(expr, smt_bb, False)
         if expr in smt_bb.smt_fun.tree_is_initialized:
             is_initialized = smt_bb.smt_fun.tree_is_initialized[expr]
             need_uninit_check = True
         else:
-            is_initialized = [BoolVal(True)] * expr.type.sizeof
+            is_initialized = [BoolVal(True)] * sizeof
         smt_args.append((value, edge))
         is_init.append((is_initialized, edge))
     if need_uninit_check and lhs is not None:
         is_initialized = []
-        for i in range(0, expr.type.sizeof):
+        for i in range(0, sizeof):
             is_init2 = []
             for initialized, edge in is_init:
                 is_init2.append((initialized[i], edge))
