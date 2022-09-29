@@ -633,6 +633,8 @@ def process_comparison(stmt, smt_bb):
             return Or(fpIsNaN(rhs0), fpIsNaN(rhs1))
         if stmt.exprcode == gcc.OrderedExpr:
             return Not(Or(fpIsNaN(rhs0), fpIsNaN(rhs1)))
+        if stmt.exprcode == gcc.LtgtExpr:
+            return Or(fpLT(rhs0, rhs1), fpGT(rhs0, rhs1))
     else:
         if stmt.exprcode == gcc.LtExpr:
             if is_unsigned:
@@ -814,6 +816,7 @@ def process_boolean_binary(stmt, smt_bb):
         gcc.UngeExpr,
         gcc.UnorderedExpr,
         gcc.OrderedExpr,
+        gcc.LtgtExpr,
     ]:
         return process_comparison(stmt, smt_bb)
 
