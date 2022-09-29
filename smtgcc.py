@@ -933,6 +933,8 @@ def convert_to_integer(value, src_type, dest_type):
             return SignExt(extbits, value)
         return value
     if isinstance(src_type, gcc.BooleanType):
+        if value.sort() == BitVecSort(1):
+            return ZeroExt(dest_type.precision - 1, value)
         bv0 = BitVecVal(0, dest_type.precision)
         bv1 = BitVecVal(1, dest_type.precision)
         return If(value, bv1, bv0)
