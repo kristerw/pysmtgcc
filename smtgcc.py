@@ -1001,7 +1001,8 @@ def process_unary(stmt, smt_bb, uninit_is_ub=True):
     assert len(stmt.rhs) == 1
 
     if isinstance(
-        stmt.rhs[0], (gcc.VarDecl, gcc.ArrayRef, gcc.ComponentRef, gcc.MemRef)
+        stmt.rhs[0],
+        (gcc.VarDecl, gcc.ArrayRef, gcc.ComponentRef, gcc.BitFieldRef, gcc.MemRef),
     ):
         res, is_initialized = load(stmt, smt_bb)
         if isinstance(stmt.lhs, gcc.SsaName):
@@ -1319,6 +1320,11 @@ def build_smt_addr(expr, smt_bb):
     elif isinstance(expr, gcc.ComponentRef):
         decl = expr.target
         offset = BitVecVal(expr.offset, 64)
+    elif isinstance(expr, gcc.BitFieldRef):
+        if expr.position.constant % 8 != 0:
+            raise NotImplementedError(f"build_smt_addr {expr.__class__}")
+        decl = expr.operand
+        offset = BitVecVal(expr.position.constant // 8, 64)
     else:
         raise NotImplementedError(f"build_smt_addr {expr.__class__}")
     mem_id, offset2 = build_smt_addr(decl, smt_bb)
@@ -1368,7 +1374,13 @@ def process_bb(bb, smt_fun):
             if stmt.retval is not None:
                 if isinstance(
                     stmt.retval,
-                    (gcc.VarDecl, gcc.ArrayRef, gcc.ComponentRef, gcc.MemRef),
+                    (
+                        gcc.VarDecl,
+                        gcc.ArrayRef,
+                        gcc.ComponentRef,
+                        gcc.BitFieldRef,
+                        gcc.MemRef,
+                    ),
                 ):
                     retval, is_initialized = load(stmt, smt_bb)
                     if len(is_initialized) == 1:
