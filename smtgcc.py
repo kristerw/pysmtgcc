@@ -1456,6 +1456,19 @@ def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
         value = BitVecVal(decl.initial.constant, decl.initial.type.precision)
         offset = BitVecVal(0, PTR_OFFSET_BITS)
         return init_bytes(mem_id, offset, size, value, memory, is_initialized)
+    if isinstance(decl.initial, gcc.StringCst):
+        bytes = []
+        for c in decl.initial.constant:
+            bytes.insert(0, BitVecVal(ord(c), 8))
+        if len(bytes) < size:
+            bytes = [BitVecVal(0, 8)] * (size - len(bytes)) + bytes
+        assert len(bytes) == size
+        if size == 1:
+            value == bytes[0]
+        else:
+            value = Concat(bytes)
+        offset = BitVecVal(0, PTR_OFFSET_BITS)
+        return init_bytes(mem_id, offset, size, value, memory, is_initialized)
     if isinstance(decl.initial.type, (gcc.ArrayType, gcc.RecordType)):
         if not isinstance(decl.initial, gcc.Constructor):
             raise NotImplementedError(
