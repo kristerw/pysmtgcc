@@ -77,6 +77,7 @@ def tv_callback(*args, **kwargs):
                 msg = "Error: " + msg
             gcc.inform(location, msg)
         function.smt_fun = None
+        function.next_pass_name = opt_pass.name
 
 
 class Function:
