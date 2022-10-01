@@ -1248,6 +1248,19 @@ def process_GimpleCall(stmt, smt_bb):
         smt_bb.smt_fun.tree_to_smt[stmt.lhs] = result
         return
     if stmt.fndecl.name in [
+        "__builtin_parity",
+        "__builtin_parityl",
+        "__builtin_parityll",
+    ]:
+        assert isinstance(stmt.lhs, gcc.SsaName)
+        value = get_tree_as_smt(stmt.rhs[2], smt_bb)
+        parity = BitVecVal(0, 1)
+        for i in range(0, stmt.rhs[2].type.precision):
+            parity = parity ^ Extract(i, i, value)
+        result = ZeroExt(stmt.lhs.type.precision - 1, parity)
+        smt_bb.smt_fun.tree_to_smt[stmt.lhs] = result
+        return
+    if stmt.fndecl.name in [
         "__builtin_bswap16",
         "__builtin_bswap32",
         "__builtin_bswap64",
