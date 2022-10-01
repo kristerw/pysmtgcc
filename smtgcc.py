@@ -1235,6 +1235,19 @@ def process_GimpleCall(stmt, smt_bb):
                     )
                 return
     if stmt.fndecl.name in [
+        "__builtin_popcount",
+        "__builtin_popcountl",
+        "__builtin_popcountll",
+    ]:
+        assert isinstance(stmt.lhs, gcc.SsaName)
+        value = get_tree_as_smt(stmt.rhs[2], smt_bb)
+        result = BitVecVal(0, stmt.lhs.type.precision)
+        for i in range(0, stmt.rhs[2].type.precision):
+            bit = Extract(i, i, value)
+            result = result + ZeroExt(stmt.lhs.type.precision - 1, bit)
+        smt_bb.smt_fun.tree_to_smt[stmt.lhs] = result
+        return
+    if stmt.fndecl.name in [
         "__builtin_bswap16",
         "__builtin_bswap32",
         "__builtin_bswap64",
