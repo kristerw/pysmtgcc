@@ -1509,6 +1509,15 @@ def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
         value = BitVecVal(decl.initial.constant, decl.initial.type.precision)
         offset = BitVecVal(0, PTR_OFFSET_BITS)
         return init_bytes(mem_id, offset, size, value, memory, is_initialized)
+    if isinstance(decl.initial.type, gcc.RealType):
+        assert isinstance(decl.initial, gcc.RealCst)
+        value = fpToIEEEBV(
+            FPVal(decl.initial.constant, get_smt_sort(decl.initial.type))
+        )
+        if decl.initial.type.precision == 80:
+            value = Concat([BitVecVal(0, 49), value])
+        offset = BitVecVal(0, PTR_OFFSET_BITS)
+        return init_bytes(mem_id, offset, size, value, memory, is_initialized)
     if isinstance(decl.initial, gcc.StringCst):
         bytes = []
         for c in decl.initial.constant:
@@ -1553,12 +1562,17 @@ def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
                 if elem[0].bitoffset % 8 != 0 or elem[0].type.precision % 8 != 0:
                     raise NotImplementedError(f"init_global_var_decl bitfield")
                 offset = BitVecVal(elem[0].offset, PTR_OFFSET_BITS)
-            if not isinstance(elem[1].type, gcc.IntegerType):
+            if isinstance(elem[1].type, gcc.IntegerType):
+                value = BitVecVal(elem[1].constant, elem[1].type.precision)
+            elif isinstance(elem[1].type, gcc.RealType):
+                value = fpToIEEEBV(FPVal(elem[1].constant, get_smt_sort(elem[1].type)))
+                if elem[1].type.precision == 80:
+                    value = Concat([BitVecVal(0, 49), value])
+            else:
                 raise NotImplementedError(
                     f"init_global_var_decl {elem[1].type.__class__}"
                 )
-            value = BitVecVal(elem[1].constant, elem[1].type.precision)
-            size = elem[1].type.precision // 8
+            size = elem[1].type.sizeof
             memory, is_initialized = init_bytes(
                 mem_id, offset, size, value, memory, is_initialized
             )
