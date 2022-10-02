@@ -43,6 +43,7 @@ class CommonState:
     def __init__(
         self,
         global_memory,
+        decl_to_memory,
         const_mem_ids,
         next_id,
         ptr_constraints,
@@ -59,7 +60,7 @@ class CommonState:
         self.memory = memory
         self.is_initialized = is_initialized
         self.mem_sizes = mem_sizes
-        self.decl_to_memory = {}
+        self.decl_to_memory = decl_to_memory
         self.fun_args = fun_args
         self.retval = None
 
@@ -115,7 +116,7 @@ class SmtFunction:
 
 
 class SmtBB:
-    def __init__(self, bb, smt_fun, mem_sizes, is_initialized):
+    def __init__(self, bb, smt_fun, mem_sizes):
         self.bb = bb
         self.smt_fun = smt_fun
         self.invokes_ub = None
@@ -128,7 +129,7 @@ class SmtBB:
         if len(bb.preds) == 0:
             self.memory = smt_fun.state.memory
             self.mem_sizes = mem_sizes
-            self.is_initialized = is_initialized
+            self.is_initialized = smt_fun.state.is_initialized
         else:
             memory = []
             mem_sizes = []
@@ -1503,6 +1504,19 @@ def init_bytes(mem_id, offset, size, value, memory, is_initialized):
 
 def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
     assert isinstance(decl, gcc.VarDecl)
+
+    # decl.initial may not initialize all elements, and the remaining
+    # must be initialized by 0. So we start by initializing all to 0.
+    # TODO: Should only do this for the bytes that are not initialized by
+    # decl.initial.
+    value = BitVecVal(0, decl.type.sizeof * 8)
+    offset = BitVecVal(0, PTR_OFFSET_BITS)
+    memory, is_initialized = init_bytes(
+        mem_id, offset, size, value, memory, is_initialized
+    )
+    if decl.initial is None:
+        return memory, is_initialized
+
     if isinstance(decl.initial.type, gcc.IntegerType):
         assert isinstance(decl.initial, gcc.IntegerCst)
         assert size == decl.initial.type.precision // 8
@@ -1591,6 +1605,7 @@ def init_common_state(fun):
     memory_objects = []
     mem_sizes = K(BitVecSort(PTR_ID_BITS), BitVecVal(0, PTR_OFFSET_BITS))
     const_mem_ids = []
+    decl_to_memory = {}
     for var in gcc.get_variables():
         if isinstance(var.decl.type, gcc.ArrayType) and not isinstance(
             var.decl.type.range, gcc.IntegerType
@@ -1601,6 +1616,7 @@ def init_common_state(fun):
             size = var.decl.type.sizeof
         memory_object = MemoryBlock(var.decl, size, next_id)
         memory_objects.append(memory_object)
+        decl_to_memory[var.decl] = memory_object
 
         mem_id = BitVecVal(next_id, PTR_ID_BITS)
         mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
@@ -1608,18 +1624,11 @@ def init_common_state(fun):
         # We should not initialize non-const global memory -- it can be
         # modified before the functions are called, so functions should
         # work with any value.
-        # For static function-local memory, we should initialize unless it
-        # can be changed. But the compiler has knowledge of how it is changed
-        # (unless a pointer escapes), so it can optimize based on the possible
-        # values (which we do not track). We therefore always initialize
-        # static memory.
-        if is_const(var.decl) or var.decl.static:
-            if var.decl.initial is not None:
-                memory, is_initialized = init_global_var_decl(
-                    var.decl, mem_id, size, memory, is_initialized
-                )
         if is_const(var.decl):
             const_mem_ids.append(mem_id)
+            memory, is_initialized = init_global_var_decl(
+                var.decl, mem_id, size, memory, is_initialized
+            )
 
         next_id = next_id + 1
 
@@ -1655,6 +1664,7 @@ def init_common_state(fun):
 
     return CommonState(
         memory_objects,
+        decl_to_memory,
         const_mem_ids,
         next_id,
         ptr_constraints,
@@ -1720,7 +1730,6 @@ def process_function(fun, state, reuse):
             smt_fun.tree_to_smt[arg] = smt_arg[0]
 
     mem_sizes = state.mem_sizes
-    is_initialized = state.is_initialized
     next_id = state.next_id
     memory_objects = state.global_memory[:]
     for obj in memory_objects:
@@ -1761,7 +1770,20 @@ def process_function(fun, state, reuse):
     local_memory = []
     for decl in smt_fun.fun.local_decls:
         if decl.static:
-            # Local static decls are included in the global decls.
+            assert decl in state.decl_to_memory
+            # Local static decls are included in the global decls, so their
+            # memory objects have already been created. But only constant
+            # decls are initialized for globals, but we need to initialize
+            # all local static decls because the compiler has knowledge of
+            # how they are changed (unless a pointer escapes), so it can
+            # optimize based on the possible values (which we do not track).
+            if not is_const(decl):
+                memory_object = state.decl_to_memory[decl]
+                mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
+                size = memory_object.size
+                state.memory, state.is_initialized = init_global_var_decl(
+                    decl, mem_id, size, state.memory, state.is_initialized
+                )
             continue
 
         if reuse and decl in state.decl_to_memory:
@@ -1778,7 +1800,9 @@ def process_function(fun, state, reuse):
             mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
             mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
         offset = BitVecVal(0, PTR_OFFSET_BITS)
-        is_initialized = mark_mem_uninitialized(mem_id, offset, size, is_initialized)
+        state.is_initialized = mark_mem_uninitialized(
+            mem_id, offset, size, state.is_initialized
+        )
 
     state.next_id = next_id
     if not reuse:
@@ -1788,7 +1812,7 @@ def process_function(fun, state, reuse):
         smt_fun.decl_to_id[obj.decl] = BitVecVal(obj.mem_id, PTR_ID_BITS)
 
     for bb in fun.cfg.inverted_post_order:
-        SmtBB(bb, smt_fun, mem_sizes, is_initialized)
+        SmtBB(bb, smt_fun, mem_sizes)
         process_bb(bb, smt_fun)
 
     if not isinstance(fun.decl.result.type, gcc.VoidType):
