@@ -1591,15 +1591,21 @@ def init_common_state(fun):
         mem_id = BitVecVal(next_id, PTR_ID_BITS)
         mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
 
-        # We should not initialize non-const memory -- it can be modified
-        # before the functions are called, so functions should work with
-        # any value.
-        if is_const(var.decl):
-            const_mem_ids.append(mem_id)
+        # We should not initialize non-const global memory -- it can be
+        # modified before the functions are called, so functions should
+        # work with any value.
+        # For static function-local memory, we should initialize unless it
+        # can be changed. But the compiler has knowledge of how it is changed
+        # (unless a pointer escapes), so it can optimize based on the possible
+        # values (which we do not track). We therefore always initialize
+        # static memory.
+        if is_const(var.decl) or var.decl.static:
             if var.decl.initial is not None:
                 memory, is_initialized = init_global_var_decl(
                     var.decl, mem_id, size, memory, is_initialized
                 )
+        if is_const(var.decl):
+            const_mem_ids.append(mem_id)
 
         next_id = next_id + 1
 
