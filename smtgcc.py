@@ -1261,6 +1261,21 @@ def process_GimpleCall(stmt, smt_bb):
         smt_bb.smt_fun.tree_to_smt[stmt.lhs] = result
         return
     if stmt.fndecl.name in [
+        "__builtin_copysignf",
+        "__builtin_copysign",
+        "__builtin_copysignl",
+    ]:
+        assert isinstance(stmt.lhs, gcc.SsaName)
+        x = get_tree_as_smt(stmt.rhs[2], smt_bb)
+        y = get_tree_as_smt(stmt.rhs[3], smt_bb)
+        precision = stmt.rhs[2].type.precision
+        x_bits = fpToIEEEBV(x)
+        y_bits = fpToIEEEBV(y)
+        y_signbit = Extract(precision - 1, precision - 1, y_bits)
+        result_bits = Concat([y_signbit, Extract(precision - 2, 0, x_bits)])
+        smt_bb.smt_fun.tree_to_smt[stmt.lhs] = fpBVToFP(result_bits, y.sort())
+        return
+    if stmt.fndecl.name in [
         "__builtin_bswap16",
         "__builtin_bswap32",
         "__builtin_bswap64",
