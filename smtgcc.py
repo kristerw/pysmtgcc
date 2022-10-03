@@ -1923,6 +1923,14 @@ def check(
     if tgt_smt_fun.invokes_ub is not None:
         solver = init_solver(src_smt_fun)
         solver.append(tgt_smt_fun.invokes_ub)
+        # We often have identical IR for src and tgt. Z3 is reasonably
+        # good at seeing this and quickly return UNSAT. But it fails doing
+        # this for some functions, and we in worst case end up with a
+        # timeout for each pass (i.e., taking several hours to compile).
+        # This issue goes away when we add a redundant src.ub != tgt.ub
+        # check (but we keep the check for tgt.ub too -- it makes the
+        # solver faster for other cases).
+        solver.append(tgt_smt_fun.invokes_ub != src_smt_fun.invokes_ub)
         timeout, model = show_solver_result(
             solver, transform_name, "UB", location, verbose
         )
