@@ -1662,6 +1662,10 @@ def init_common_state(fun):
         smt_size = Select(mem_sizes, ptr.mem_id)
         ptr_constraints.append(And(ptr.offset >= 0, ptr.offset < smt_size))
         ptr_constraints.append(ptr.offset + type.dereference.sizeof < smt_size)
+        if type.dereference.alignmentof > 1:
+            ptr_constraints.append(
+                (ptr.offset & (type.dereference.alignmentof - 1)) == 0
+            )
 
     return CommonState(
         memory_objects,
