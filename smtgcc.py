@@ -1659,7 +1659,7 @@ def init_common_state(fun):
     ptr_constraints = []
     for ptr in arg_ptrs:
         ptr_constraints.append(And(ptr.mem_id > 0, ptr.mem_id < next_id))
-        smt_size = Select(mem_sizes, mem_id)
+        smt_size = Select(mem_sizes, ptr.mem_id)
         ptr_constraints.append(And(ptr.offset >= 0, ptr.offset < smt_size))
 
     return CommonState(
