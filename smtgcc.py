@@ -1640,7 +1640,7 @@ def init_common_state(fun):
             mem_id = Extract(63, PTR_OFFSET_BITS, ptr)
             offset = Extract(PTR_OFFSET_BITS - 1, 0, ptr)
             smt_arg = SmtPointer(mem_id, offset)
-            arg_ptrs.append(smt_arg)
+            arg_ptrs.append((smt_arg, arg.type))
 
             memory_object = MemoryBlock(None, ANON_MEM_SIZE, next_id)
             memory_objects.append(memory_object)
@@ -1657,10 +1657,11 @@ def init_common_state(fun):
         fun_args.append((smt_arg, arg.type))
 
     ptr_constraints = []
-    for ptr in arg_ptrs:
+    for ptr, type in arg_ptrs:
         ptr_constraints.append(And(ptr.mem_id > 0, ptr.mem_id < next_id))
         smt_size = Select(mem_sizes, ptr.mem_id)
         ptr_constraints.append(And(ptr.offset >= 0, ptr.offset < smt_size))
+        ptr_constraints.append(ptr.offset + type.dereference.sizeof < smt_size)
 
     return CommonState(
         memory_objects,
