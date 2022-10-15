@@ -1658,14 +1658,23 @@ def init_common_state(fun):
 
     ptr_constraints = []
     for ptr, type in arg_ptrs:
-        ptr_constraints.append(And(ptr.mem_id > 0, ptr.mem_id < next_id))
+        is_valid_ptr = []
+        # Check that mem_id is valid.
+        is_valid_ptr.append(And(ptr.mem_id > 0, ptr.mem_id < next_id))
+        # Check that offset is within valid range.
         smt_size = Select(mem_sizes, ptr.mem_id)
-        ptr_constraints.append(And(ptr.offset >= 0, ptr.offset < smt_size))
-        ptr_constraints.append(ptr.offset + type.dereference.sizeof < smt_size)
-        if type.dereference.alignmentof > 1:
-            ptr_constraints.append(
-                (ptr.offset & (type.dereference.alignmentof - 1)) == 0
-            )
+        is_valid_ptr.append(And(ptr.offset >= 0, ptr.offset < smt_size))
+        # Check that there is enough space for the type in the buffer.
+        is_valid_ptr.append(ptr.offset + type.dereference.sizeof < smt_size)
+        # Check that pointer has correct alignment for type.
+        alignment = type.dereference.alignmentof
+        if alignment > 1:
+            is_valid_ptr.append((ptr.offset & (alignment - 1)) == 0)
+
+        # NULL is also a valid value for pointer arguments.
+        is_null_ptr = And(ptr.mem_id == 0, ptr.offset == 0)
+
+        ptr_constraints.append(Or(And(is_valid_ptr), is_null_ptr))
 
     return CommonState(
         memory_objects,
