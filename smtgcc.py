@@ -297,6 +297,7 @@ def load_value(expr, smt_bb):
         mem_id = Extract(63, PTR_OFFSET_BITS, result)
         offset = Extract(PTR_OFFSET_BITS - 1, 0, result)
         result = SmtPointer(mem_id, offset)
+        smt_bb.add_ub(Not(smt_is_valid_pointer(result, expr.type, smt_bb)))
     elif not isinstance(expr.type, gcc.IntegerType):
         raise NotImplementedError("load " + str(expr.type.__class__))
 
@@ -355,6 +356,24 @@ def out_of_bound_ub_check(mem_id, offset, size, smt_bb):
             assert is_false(is_out_of_bound)
     else:
         smt_bb.add_ub(is_out_of_bound)
+
+
+def smt_is_valid_pointer(ptr, type, smt_bb):
+    """A pointer is valid if it is NULL or is correctly aligned for the type
+    and points to memory with enough space for the type."""
+    assert isinstance(ptr, SmtPointer)
+    assert isinstance(type, gcc.PointerType)
+    is_valid_ptr = []
+    next_id = smt_bb.smt_fun.state.next_id
+    is_valid_ptr.append(And(ptr.mem_id > 0, ptr.mem_id < next_id))
+    smt_size = Select(smt_bb.mem_sizes, ptr.mem_id)
+    is_valid_ptr.append(And(ptr.offset >= 0, ptr.offset < smt_size))
+    is_valid_ptr.append(ptr.offset + type.dereference.sizeof < smt_size)
+    alignment = type.dereference.alignmentof
+    if alignment > 1:
+        is_valid_ptr.append((ptr.offset & (alignment - 1)) == 0)
+    is_null_ptr = And(ptr.mem_id == 0, ptr.offset == 0)
+    return Or(And(is_valid_ptr), is_null_ptr)
 
 
 def const_mem_ub_check(mem_id, smt_bb):
@@ -554,7 +573,7 @@ def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
         # Ignore uninit_is_ub as we are doing an operation on the value,
         # which is UB if iti is uninitialized.
         value = get_tree_as_smt(expr.operand, smt_bb, True)
-        return bit_cast(value, expr.operand.type, expr.type)
+        return bit_cast(value, expr.operand.type, expr.type, smt_bb)
     if isinstance(expr, gcc.RealCst):
         return FPVal(expr.constant, get_smt_sort(expr.type))
     if isinstance(expr, gcc.AddrExpr):
@@ -902,7 +921,7 @@ def add_to_offset(offset, val, smt_bb):
     return offset
 
 
-def bit_cast(value, src_type, dest_type):
+def bit_cast(value, src_type, dest_type, smt_bb):
     if isinstance(src_type, gcc.RealType):
         value = fpToIEEEBV(value)
     elif isinstance(src_type, gcc.PointerType):
@@ -915,7 +934,9 @@ def bit_cast(value, src_type, dest_type):
     if isinstance(dest_type, gcc.PointerType):
         mem_id = Extract(63, PTR_OFFSET_BITS, value)
         offset = Extract(PTR_OFFSET_BITS - 1, 0, value)
-        return SmtPointer(mem_id, offset)
+        ptr = SmtPointer(mem_id, offset)
+        smt_bb.add_ub(Not(smt_is_valid_pointer(ptr, dest_type, smt_bb)))
+        return ptr
     if isinstance(dest_type, gcc.IntegerType):
         return value
 
