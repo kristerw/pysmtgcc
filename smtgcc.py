@@ -297,7 +297,6 @@ def load_value(expr, smt_bb):
         mem_id = Extract(63, PTR_OFFSET_BITS, result)
         offset = Extract(PTR_OFFSET_BITS - 1, 0, result)
         result = SmtPointer(mem_id, offset)
-        smt_bb.add_ub(Not(smt_is_valid_pointer(result, expr.type, smt_bb)))
     elif not isinstance(expr.type, gcc.IntegerType):
         raise NotImplementedError("load " + str(expr.type.__class__))
 
@@ -360,20 +359,18 @@ def out_of_bound_ub_check(mem_id, offset, size, smt_bb):
 
 def smt_is_valid_pointer(ptr, type, smt_bb):
     """A pointer is valid if it is NULL or is correctly aligned for the type
-    and points to memory with enough space for the type."""
+    and points to (or "one past") valid memory."""
     assert isinstance(ptr, SmtPointer)
     assert isinstance(type, gcc.PointerType)
     is_valid_ptr = []
     next_id = smt_bb.smt_fun.state.next_id
-    is_valid_ptr.append(And(ptr.mem_id > 0, ptr.mem_id < next_id))
+    is_valid_ptr.append(And(ptr.mem_id >= 0, ptr.mem_id < next_id))
     smt_size = Select(smt_bb.mem_sizes, ptr.mem_id)
-    is_valid_ptr.append(And(ptr.offset >= 0, ptr.offset < smt_size))
-    is_valid_ptr.append(ptr.offset + type.dereference.sizeof < smt_size)
+    is_valid_ptr.append(And(ptr.offset >= 0, ptr.offset <= smt_size))
     alignment = type.dereference.alignmentof
     if alignment > 1:
         is_valid_ptr.append((ptr.offset & (alignment - 1)) == 0)
-    is_null_ptr = And(ptr.mem_id == 0, ptr.offset == 0)
-    return Or(And(is_valid_ptr), is_null_ptr)
+    return And(is_valid_ptr)
 
 
 def const_mem_ub_check(mem_id, smt_bb):
@@ -526,7 +523,7 @@ def uninit_var_to_smt(expr):
     return Const(name, get_smt_sort(expr.type))
 
 
-def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
+def get_tree_as_smt_1(expr, smt_bb, uninit_is_ub=True):
     if uninit_is_ub and expr in smt_bb.smt_fun.tree_is_initialized:
         is_initialized = smt_bb.smt_fun.tree_is_initialized[expr]
         if len(is_initialized) == 1:
@@ -581,6 +578,13 @@ def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
         return SmtPointer(mem_id, offset)
 
     raise NotImplementedError(f"get_tree_as_smt {expr.__class__} {expr.type.__class__}")
+
+
+def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
+    ret = get_tree_as_smt_1(expr, smt_bb, uninit_is_ub)
+    if uninit_is_ub and isinstance(expr.type, gcc.PointerType):
+        smt_bb.add_ub(Not(smt_is_valid_pointer(ret, expr.type, smt_bb)))
+    return ret
 
 
 def is_bitfield(expr):
@@ -934,9 +938,7 @@ def bit_cast(value, src_type, dest_type, smt_bb):
     if isinstance(dest_type, gcc.PointerType):
         mem_id = Extract(63, PTR_OFFSET_BITS, value)
         offset = Extract(PTR_OFFSET_BITS - 1, 0, value)
-        ptr = SmtPointer(mem_id, offset)
-        smt_bb.add_ub(Not(smt_is_valid_pointer(ptr, dest_type, smt_bb)))
-        return ptr
+        return SmtPointer(mem_id, offset)
     if isinstance(dest_type, gcc.IntegerType):
         return value
 
@@ -1681,21 +1683,16 @@ def init_common_state(fun):
     for ptr, type in arg_ptrs:
         is_valid_ptr = []
         # Check that mem_id is valid.
-        is_valid_ptr.append(And(ptr.mem_id > 0, ptr.mem_id < next_id))
+        is_valid_ptr.append(And(ptr.mem_id >= 0, ptr.mem_id < next_id))
         # Check that offset is within valid range.
         smt_size = Select(mem_sizes, ptr.mem_id)
         is_valid_ptr.append(And(ptr.offset >= 0, ptr.offset < smt_size))
-        # Check that there is enough space for the type in the buffer.
-        is_valid_ptr.append(ptr.offset + type.dereference.sizeof < smt_size)
         # Check that pointer has correct alignment for type.
         alignment = type.dereference.alignmentof
         if alignment > 1:
             is_valid_ptr.append((ptr.offset & (alignment - 1)) == 0)
 
-        # NULL is also a valid value for pointer arguments.
-        is_null_ptr = And(ptr.mem_id == 0, ptr.offset == 0)
-
-        ptr_constraints.append(Or(And(is_valid_ptr), is_null_ptr))
+        ptr_constraints.append(And(is_valid_ptr))
 
     return CommonState(
         memory_objects,
