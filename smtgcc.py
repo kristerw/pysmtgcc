@@ -1364,7 +1364,7 @@ def process_ArrayRef(array_ref, smt_bb):
     )
 
 
-def build_smt_addr(expr, smt_bb):
+def build_smt_addr(expr, smt_bb, object_size=None):
     "Return a mem_id/offset pair for an expr representing an address."
     if isinstance(expr, gcc.MemRef):
         ptr = get_tree_as_smt(expr.operand, smt_bb)
@@ -1374,6 +1374,9 @@ def build_smt_addr(expr, smt_bb):
         offset = add_to_offset(ptr.offset, mem_ref_offset, smt_bb)
         if expr.type.alignmentof > 1:
             smt_bb.add_ub((offset & (expr.type.alignmentof - 1)) != 0)
+        if object_size is not None:
+            smt_size = Select(smt_bb.mem_sizes, ptr.mem_id)
+            smt_bb.add_ub(offset + object_size > smt_size)
         return ptr.mem_id, offset
     if isinstance(expr, gcc.VarDecl):
         assert expr in smt_bb.smt_fun.decl_to_id
@@ -1381,8 +1384,10 @@ def build_smt_addr(expr, smt_bb):
         return mem_id, BitVecVal(0, PTR_OFFSET_BITS)
 
     if isinstance(expr, gcc.ArrayRef):
+        object_size = expr.array.type.sizeof
         decl, offset = process_ArrayRef(expr, smt_bb)
     elif isinstance(expr, gcc.ComponentRef):
+        object_size = expr.target.type.sizeof
         decl = expr.target
         offset = BitVecVal(expr.offset, 64)
     elif isinstance(expr, gcc.BitFieldRef):
@@ -1392,7 +1397,7 @@ def build_smt_addr(expr, smt_bb):
         offset = BitVecVal(expr.position.constant // 8, 64)
     else:
         raise NotImplementedError(f"build_smt_addr {expr.__class__}")
-    mem_id, offset2 = build_smt_addr(decl, smt_bb)
+    mem_id, offset2 = build_smt_addr(decl, smt_bb, object_size)
     new_offset = add_to_offset(offset2, offset, smt_bb)
     return mem_id, new_offset
 
