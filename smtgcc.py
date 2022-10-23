@@ -1384,7 +1384,8 @@ def build_smt_addr(expr, smt_bb, object_size=None):
         return mem_id, BitVecVal(0, PTR_OFFSET_BITS)
 
     if isinstance(expr, gcc.ArrayRef):
-        object_size = expr.array.type.sizeof
+        if hasattr(expr.array.type, "sizeof"):
+            object_size = expr.array.type.sizeof
         decl, offset = process_ArrayRef(expr, smt_bb)
     elif isinstance(expr, gcc.ComponentRef):
         object_size = expr.target.type.sizeof
