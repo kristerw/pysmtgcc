@@ -357,22 +357,6 @@ def out_of_bound_ub_check(mem_id, offset, size, smt_bb):
         smt_bb.add_ub(is_out_of_bound)
 
 
-def smt_is_valid_pointer(ptr, type, smt_bb):
-    """A pointer is valid if it is NULL or is correctly aligned for the type
-    and points to (or "one past") valid memory."""
-    assert isinstance(ptr, SmtPointer)
-    assert isinstance(type, gcc.PointerType)
-    is_valid_ptr = []
-    next_id = smt_bb.smt_fun.state.next_id
-    is_valid_ptr.append(And(ptr.mem_id >= 0, ptr.mem_id < next_id))
-    smt_size = Select(smt_bb.mem_sizes, ptr.mem_id)
-    is_valid_ptr.append(And(ptr.offset >= 0, ptr.offset <= smt_size))
-    alignment = type.dereference.alignmentof
-    if alignment > 1:
-        is_valid_ptr.append((ptr.offset & (alignment - 1)) == 0)
-    return And(is_valid_ptr)
-
-
 def const_mem_ub_check(mem_id, smt_bb):
     const_mem_ids = smt_bb.smt_fun.state.const_mem_ids
     if const_mem_ids:
@@ -523,7 +507,7 @@ def uninit_var_to_smt(expr):
     return Const(name, get_smt_sort(expr.type))
 
 
-def get_tree_as_smt_1(expr, smt_bb, uninit_is_ub=True):
+def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
     if uninit_is_ub and expr in smt_bb.smt_fun.tree_is_initialized:
         is_initialized = smt_bb.smt_fun.tree_is_initialized[expr]
         if len(is_initialized) == 1:
@@ -578,13 +562,6 @@ def get_tree_as_smt_1(expr, smt_bb, uninit_is_ub=True):
         return SmtPointer(mem_id, offset)
 
     raise NotImplementedError(f"get_tree_as_smt {expr.__class__} {expr.type.__class__}")
-
-
-def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
-    ret = get_tree_as_smt_1(expr, smt_bb, uninit_is_ub)
-    if uninit_is_ub and isinstance(expr.type, gcc.PointerType):
-        smt_bb.add_ub(Not(smt_is_valid_pointer(ret, expr.type, smt_bb)))
-    return ret
 
 
 def is_bitfield(expr):
