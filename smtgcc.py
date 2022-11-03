@@ -1968,8 +1968,16 @@ def check(
             valid_ptr = Or(valid_ptr, And(valid_id, valid_offset))
         src_mem = src_smt_fun.memory
         tgt_mem = tgt_smt_fun.memory
+        src_is_init = src_smt_fun.is_initialized
+        tgt_is_init = tgt_smt_fun.is_initialized
         solver.append(valid_ptr)
-        solver.append(Select(src_mem, ptr) != Select(tgt_mem, ptr))
+        solver.append(Select(src_is_init, ptr))
+        solver.append(
+            Or(
+                Select(src_mem, ptr) != Select(tgt_mem, ptr),
+                Not(Select(tgt_is_init, ptr)),
+            )
+        )
         timeout, model = show_solver_result(
             solver, transform_name, "memory", location, verbose
         )
