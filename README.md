@@ -1,5 +1,9 @@
 # pysmtgcc
-TBD
+See "[GCC Translation Validation](https://kristerw.github.io/2022/09/13/translation-validation/)" for background information of this project. The implementation is described in a series of blog posts:
+1. [Writing a GCC plugin in Python](https://kristerw.github.io/2022/10/20/gcc-python-plugin/)
+2. [Verifying GCC optimizations using an SMT solver](https://kristerw.github.io/2022/11/01/verifying-optimizations/)
+3. TBD Memory
+4. TBD Control flow
 
 # Installing
 ### gcc-python-plugin
