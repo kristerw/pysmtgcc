@@ -1690,13 +1690,11 @@ def init_common_state(fun):
     const_mem_ids = []
     decl_to_memory = {}
     for var in gcc.get_variables():
-        if isinstance(var.decl.type, gcc.ArrayType) and not isinstance(
-            var.decl.type.range, gcc.IntegerType
-        ):
-            # This is an array declared without size. Invent a size...
-            size = ANON_MEM_SIZE
-        else:
+        if hasattr(var.decl.type, "sizeof"):
             size = var.decl.type.sizeof
+        else:
+            # This is an array declared without size, etc.. Invent a size...
+            size = ANON_MEM_SIZE
         memory_object = MemoryBlock(var.decl, size, next_id)
         memory_objects.append(memory_object)
         decl_to_memory[var.decl] = memory_object
