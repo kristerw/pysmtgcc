@@ -1515,7 +1515,7 @@ def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
     # must be initialized by 0. So we start by initializing all to 0.
     # TODO: Should only do this for the bytes that are not initialized by
     # decl.initial.
-    value = BitVecVal(0, decl.type.sizeof * 8)
+    value = BitVecVal(0, size * 8)
     offset = BitVecVal(0, PTR_OFFSET_BITS)
     memory, is_initialized = init_bytes(
         mem_id, offset, size, value, memory, is_initialized
