@@ -1600,6 +1600,83 @@ def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
     raise NotImplementedError(f"init_global_var_decl {decl.initial.type.__class__}")
 
 
+def constrain_pointer(ptr, type, next_id, mem_sizes):
+    "Generate constraint for a pointer to global memory."
+    is_valid_ptr = []
+    # Check that mem_id is valid.
+    is_valid_ptr.append(And(ptr.mem_id >= 0, ptr.mem_id < next_id))
+    # Check that offset is within valid range (or one past).
+    smt_size = Select(mem_sizes, ptr.mem_id)
+    is_valid_ptr.append(And(ptr.offset >= 0, ptr.offset <= smt_size))
+    # Check that pointer has correct alignment for type.
+    alignment = type.dereference.alignmentof
+    if alignment > 1:
+        is_valid_ptr.append((ptr.offset & (alignment - 1)) == 0)
+    return And(is_valid_ptr)
+
+
+def has_pointer(type):
+    if isinstance(type, gcc.PointerType):
+        return True
+    if isinstance(type, (gcc.RecordType, gcc.UnionType)):
+        for field in type.fields:
+            if has_pointer(field.type):
+                return True
+    elif isinstance(type, gcc.ArrayType):
+        return has_pointer(type.dereference)
+    return False
+
+
+def constrain_global_pointers(
+    type, mem_id, offset, ptr_constraints, memory, next_id, mem_sizes
+):
+    if isinstance(type, gcc.PointerType):
+        bytes = []
+        ptr = simplify(Concat([mem_id, offset]))
+        for i in range(0, 8):
+            p = simplify(ptr + i)
+            bytes.insert(0, Select(memory, p))
+        ptr = Concat(bytes)
+        mem_id = Extract(63, PTR_OFFSET_BITS, ptr)
+        offset = Extract(PTR_OFFSET_BITS - 1, 0, ptr)
+        ptr = SmtPointer(mem_id, offset)
+        ptr_constraint = constrain_pointer(ptr, type, next_id, mem_sizes)
+        ptr_constraints.append(ptr_constraint)
+    elif isinstance(type, (gcc.RecordType, gcc.UnionType)):
+        for field in type.fields:
+            ptr_constraints = constrain_global_pointers(
+                field.type,
+                mem_id,
+                simplify(offset + field.offset),
+                ptr_constraints,
+                memory,
+                next_id,
+                mem_sizes,
+            )
+    elif isinstance(type, gcc.ArrayType):
+        if type.range is not None:
+            assert isinstance(type.range.type, gcc.IntegerType)
+            assert type.range.min_value.constant == 0
+            size = type.range.max_value.constant
+            if has_pointer(type.dereference):
+                if size > MAX_MEMORY_UNROLL_LIMIT:
+                    raise NotImplementedError(
+                        f"constrain_global_pointers array too big ({size})"
+                    )
+                for i in range(0, size + 1):
+                    ptr_constraints = constrain_global_pointers(
+                        type.dereference,
+                        mem_id,
+                        offset,
+                        ptr_constraints,
+                        memory,
+                        next_id,
+                        mem_sizes,
+                    )
+                    offset = simplify(offset + type.dereference.sizeof)
+    return ptr_constraints
+
+
 def init_common_state(fun):
     memory = Array(".memory", BitVecSort(64), BitVecSort(8))
     # We must treat arbitrarily global memory as initialized (as we
@@ -1664,18 +1741,19 @@ def init_common_state(fun):
 
     ptr_constraints = []
     for ptr, type in arg_ptrs:
-        is_valid_ptr = []
-        # Check that mem_id is valid.
-        is_valid_ptr.append(And(ptr.mem_id >= 0, ptr.mem_id < next_id))
-        # Check that offset is within valid range.
-        smt_size = Select(mem_sizes, ptr.mem_id)
-        is_valid_ptr.append(And(ptr.offset >= 0, ptr.offset < smt_size))
-        # Check that pointer has correct alignment for type.
-        alignment = type.dereference.alignmentof
-        if alignment > 1:
-            is_valid_ptr.append((ptr.offset & (alignment - 1)) == 0)
+        ptr_constraint = constrain_pointer(ptr, type, next_id, mem_sizes)
+        ptr_constraints.append(ptr_constraint)
 
-        ptr_constraints.append(And(is_valid_ptr))
+    for var in gcc.get_variables():
+        ptr_constraints = constrain_global_pointers(
+            var.decl.type,
+            mem_id,
+            BitVecVal(0, PTR_OFFSET_BITS),
+            ptr_constraints,
+            memory,
+            next_id,
+            mem_sizes,
+        )
 
     return CommonState(
         memory_objects,
