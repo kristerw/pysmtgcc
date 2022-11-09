@@ -1013,23 +1013,16 @@ def process_unary(stmt, smt_bb, uninit_is_ub=True):
     # We want to treat load of an uninitialized local value in the same
     # way as read of an uninitialized global value. But uninitialized
     # local values are encoded as gcc.SsaName, so we need to disable the
-    # check for undefined value in get_tree_as_smt and do the check here
-    # when we know if the value is just placed in a new gcc.SsaName (which
-    # is allowed) or used in an operation (which is UB).
-    rhs = get_tree_as_smt(stmt.rhs[0], smt_bb, False)
+    # check for undefined value in get_tree_as_smt when we know if the
+    # value is just placed in a new gcc.SsaName.
+    rhs = get_tree_as_smt(
+        stmt.rhs[0], smt_bb, uninit_is_ub and stmt.exprcode != gcc.SsaName
+    )
     if stmt.exprcode == gcc.SsaName:
         if stmt.rhs[0] in smt_bb.smt_fun.tree_is_initialized:
             is_initialized = smt_bb.smt_fun.tree_is_initialized[stmt.rhs[0]]
             smt_bb.smt_fun.tree_is_initialized[stmt.lhs] = is_initialized
         return rhs
-
-    if uninit_is_ub and stmt.rhs[0] in smt_bb.smt_fun.tree_is_initialized:
-        is_initialized = smt_bb.smt_fun.tree_is_initialized[stmt.rhs[0]]
-        if len(is_initialized) == 1:
-            is_uninitialized = Not(is_initialized[0])
-        else:
-            is_uninitialized = Not(And(is_initialized))
-        smt_bb.add_ub(is_uninitialized)
 
     if stmt.exprcode == gcc.NopExpr:
         src_type = stmt.rhs[0].type
