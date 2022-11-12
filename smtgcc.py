@@ -49,6 +49,7 @@ class CommonState:
         ptr_constraints,
         memory,
         mem_sizes,
+        mem_id_valid,
         is_initialized,
         fun_args,
     ):
@@ -60,6 +61,7 @@ class CommonState:
         self.memory = memory
         self.is_initialized = is_initialized
         self.mem_sizes = mem_sizes
+        self.mem_id_valid = mem_id_valid
         self.decl_to_memory = decl_to_memory
         self.fun_args = fun_args
         self.retval = None
@@ -116,7 +118,7 @@ class SmtFunction:
 
 
 class SmtBB:
-    def __init__(self, bb, smt_fun, mem_sizes):
+    def __init__(self, bb, smt_fun, mem_sizes, mem_id_valid):
         self.bb = bb
         self.smt_fun = smt_fun
         self.invokes_ub = None
@@ -129,18 +131,22 @@ class SmtBB:
         if len(bb.preds) == 0:
             self.memory = smt_fun.state.memory
             self.mem_sizes = mem_sizes
+            self.mem_id_valid = mem_id_valid
             self.is_initialized = smt_fun.state.is_initialized
         else:
             memory = []
             mem_sizes = []
             is_initialized = []
+            mem_id_valid = []
             for edge in bb.preds:
                 src_smt_bb = smt_fun.bb2smt[edge.src]
                 memory.append((src_smt_bb.memory, edge))
                 mem_sizes.append((src_smt_bb.mem_sizes, edge))
+                mem_id_valid.append((src_smt_bb.mem_id_valid, edge))
                 is_initialized.append((src_smt_bb.is_initialized, edge))
             self.memory = process_phi_smt_args(memory, smt_fun)
             self.mem_sizes = process_phi_smt_args(mem_sizes, smt_fun)
+            self.mem_id_valid = process_phi_smt_args(mem_id_valid, smt_fun)
             self.is_initialized = process_phi_smt_args(is_initialized, smt_fun)
 
         # Create condition telling if this BB is executed or not.
@@ -342,6 +348,7 @@ def out_of_bound_ub_check(mem_id, offset, size, smt_bb):
             assert is_false(is_valid_mem_id)
     else:
         smt_bb.add_ub(is_valid_mem_id)
+    smt_bb.add_ub(Not(Select(smt_bb.mem_id_valid, mem_id)))
 
     smt_size = Select(smt_bb.mem_sizes, mem_id)
     if is_bv_value(mem_id):
@@ -459,14 +466,12 @@ def store(stmt, smt_bb):
         if not (stmt.rhs[0].is_clobber or len(stmt.rhs[0].elements) == 0):
             raise NotImplementedError("store constructor that is not a clobber")
         size = stmt.rhs[0].type.sizeof
-        if size == 0:
-            # This happens for {CLOBBER(eol) constructors for zero
-            # sized arrays such as "int x[0];".
-            return
         if size > MAX_MEMORY_UNROLL_LIMIT:
             raise NotImplementedError(f"store large constructor ({size} bytes)")
         mem_id, smt_offset = build_smt_addr(stmt.lhs, smt_bb)
-        if stmt.rhs[0].is_clobber:
+        if stmt.rhs[0].is_clobber_eol:
+            smt_bb.mem_id_valid = Store(smt_bb.mem_id_valid, mem_id, False)
+        elif stmt.rhs[0].is_clobber:
             smt_bb.is_initialized = mark_mem_uninitialized(
                 mem_id, smt_offset, size, smt_bb.is_initialized
             )
@@ -1432,6 +1437,15 @@ def process_bb(bb, smt_fun):
                 else:
                     retval = get_tree_as_smt(stmt.retval, smt_bb)
                 if isinstance(retval, SmtPointer):
+                    mem_id = retval.mem_id
+                    smt_bb.add_ub(
+                        Not(
+                            And(
+                                ULT(mem_id, smt_bb.smt_fun.state.next_id),
+                                Select(smt_bb.mem_id_valid, mem_id),
+                            )
+                        )
+                    )
                     retval = retval.bitvector()
                 smt_bb.retval = retval
         elif isinstance(stmt, gcc.GimpleCond):
@@ -1680,6 +1694,8 @@ def init_common_state(fun):
     next_id = 1
     memory_objects = []
     mem_sizes = K(BitVecSort(PTR_ID_BITS), BitVecVal(0, PTR_OFFSET_BITS))
+    mem_id_valid = K(BitVecSort(PTR_ID_BITS), BoolVal(False))
+    mem_id_valid = Store(mem_id_valid, 0, True)
     const_mem_ids = []
     decl_to_memory = {}
     for var in gcc.get_variables():
@@ -1694,6 +1710,7 @@ def init_common_state(fun):
 
         mem_id = BitVecVal(next_id, PTR_ID_BITS)
         mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+        mem_id_valid = Store(mem_id_valid, mem_id, True)
 
         # We should not initialize non-const global memory -- it can be
         # modified before the functions are called, so functions should
@@ -1723,6 +1740,7 @@ def init_common_state(fun):
             mem_sizes = Store(
                 mem_sizes, mem_id, BitVecVal(ANON_MEM_SIZE, PTR_OFFSET_BITS)
             )
+            mem_id_valid = Store(mem_id_valid, mem_id, True)
 
             next_id = next_id + 1
         else:
@@ -1754,6 +1772,7 @@ def init_common_state(fun):
         ptr_constraints,
         memory,
         mem_sizes,
+        mem_id_valid,
         is_initialized,
         fun_args,
     )
@@ -1814,6 +1833,7 @@ def process_function(fun, state, reuse):
             smt_fun.tree_to_smt[arg] = smt_arg[0]
 
     mem_sizes = state.mem_sizes
+    mem_id_valid = state.mem_id_valid
     next_id = state.next_id
     memory_objects = state.global_memory[:]
     for obj in memory_objects:
@@ -1824,6 +1844,7 @@ def process_function(fun, state, reuse):
             size = memory_object.size
             mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
             mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+            mem_id_valid = Store(mem_id_valid, mem_id, True)
 
     # Some passes (such as switchconv) may add new global variables, so we
     # need to add global variables not present in the common state.
@@ -1840,6 +1861,8 @@ def process_function(fun, state, reuse):
             memory_objects.append(memory_object)
             mem_id = BitVecVal(next_id, PTR_ID_BITS)
             mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+            mem_id_valid = Store(mem_id_valid, mem_id, True)
+
             # We should not initialize non-const memory -- it can be modified
             # before the functions are called, so functions should work with
             # any value.
@@ -1883,6 +1906,8 @@ def process_function(fun, state, reuse):
             memory_objects.append(memory_object)
             mem_id = BitVecVal(memory_object.mem_id, PTR_ID_BITS)
             mem_sizes = Store(mem_sizes, mem_id, BitVecVal(size, PTR_OFFSET_BITS))
+            mem_id_valid = Store(mem_id_valid, mem_id, True)
+
         offset = BitVecVal(0, PTR_OFFSET_BITS)
         state.is_initialized = mark_mem_uninitialized(
             mem_id, offset, size, state.is_initialized
@@ -1896,7 +1921,7 @@ def process_function(fun, state, reuse):
         smt_fun.decl_to_id[obj.decl] = BitVecVal(obj.mem_id, PTR_ID_BITS)
 
     for bb in fun.cfg.inverted_post_order:
-        SmtBB(bb, smt_fun, mem_sizes)
+        SmtBB(bb, smt_fun, mem_sizes, mem_id_valid)
         process_bb(bb, smt_fun)
 
     if not isinstance(fun.decl.result.type, gcc.VoidType):
