@@ -36,11 +36,6 @@ def tv_callback(*args, **kwargs):
     if opt_pass.name[0] == "*":
         return
 
-    if function.next_pass_name in ["isolate-paths"]:
-        # This is a pass that may change the IR in a way that makes us
-        # (incorrectly) believe the transformation is invalid.
-        function.smt_fun = None
-
     try:
         if function.smt_fun is not None:
             src_smt_fun = function.smt_fun
