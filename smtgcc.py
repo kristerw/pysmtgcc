@@ -1685,6 +1685,8 @@ def constrain_global_pointers(
 
 
 def init_common_state(fun):
+    find_unimplemented(fun)
+
     memory = Array(".memory", BitVecSort(64), BitVecSort(8))
     # We must treat arbitrarily global memory as initialized (as we
     # cannot see if/what other functions has written), so let "true"
