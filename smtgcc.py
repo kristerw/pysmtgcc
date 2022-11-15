@@ -1518,6 +1518,9 @@ def init_bytes(mem_id, offset, size, value, memory, is_initialized):
 def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
     assert isinstance(decl, gcc.VarDecl)
 
+    if size == 0:
+        return memory, is_initialized
+
     # decl.initial may not initialize all elements, and the remaining
     # must be initialized by 0. So we start by initializing all to 0.
     # TODO: Should only do this for the bytes that are not initialized by
