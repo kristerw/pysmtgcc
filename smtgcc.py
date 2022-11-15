@@ -1268,6 +1268,8 @@ def process_GimpleCall(stmt, smt_bb):
         x = get_tree_as_smt(stmt.rhs[2], smt_bb)
         y = get_tree_as_smt(stmt.rhs[3], smt_bb)
         precision = stmt.rhs[2].type.precision
+        if precision == 80:
+            precision = 79
         x_bits = fpToIEEEBV(x)
         y_bits = fpToIEEEBV(y)
         y_signbit = Extract(precision - 1, precision - 1, y_bits)
