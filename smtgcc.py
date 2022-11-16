@@ -311,10 +311,14 @@ def load_value(expr, smt_bb):
 
 def load_bitfield(expr, smt_bb):
     assert is_bitfield(expr)
-    size = (expr.bitoffset + expr.type.precision + 7) // 8
+    if isinstance(expr, gcc.BitFieldRef):
+        bitoffset = expr.position.constant & 7
+    else:
+        bitoffset = expr.bitoffset
+    size = (bitoffset + expr.type.precision + 7) // 8
     mem_id, offset = build_smt_addr(expr, smt_bb)
     bytes, is_initialized = load_bytes(mem_id, offset, size, smt_bb)
-    result = Extract(expr.bitoffset + expr.type.precision - 1, expr.bitoffset, bytes)
+    result = Extract(bitoffset + expr.type.precision - 1, bitoffset, bytes)
     # The value in is_initialized may be of the wrong size; for example, when
     # loading a 16-bit value (2 bytes) from a misaligned 16-bit bitfield
     # (3 bytes).
@@ -430,17 +434,19 @@ def store_bitfield(expr, value, smt_bb):
         assert expr.type.precision == 1
         value = If(value, BitVecVal(1, 1), BitVecVal(0, 1))
 
-    size = (expr.bitoffset + expr.type.precision + 7) // 8
+    if isinstance(expr, gcc.BitFieldRef):
+        bitoffset = expr.position.constant & 7
+    else:
+        bitoffset = expr.bitoffset
+    size = (bitoffset + expr.type.precision + 7) // 8
     result, _ = load_bytes(mem_id, offset, size, smt_bb)
     parts = []
-    if expr.bitoffset + expr.type.precision != size * 8:
+    if bitoffset + expr.type.precision != size * 8:
         nof_bits = size * 8
-        parts.append(
-            Extract(nof_bits - 1, expr.bitoffset + expr.type.precision, result)
-        )
+        parts.append(Extract(nof_bits - 1, bitoffset + expr.type.precision, result))
     parts.append(value)
-    if expr.bitoffset != 0:
-        parts.append(Extract(expr.bitoffset - 1, 0, result))
+    if bitoffset != 0:
+        parts.append(Extract(bitoffset - 1, 0, result))
     if len(parts) == 1:
         value = parts[0]
     else:
@@ -571,11 +577,15 @@ def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
 
 def is_bitfield(expr):
     "Return true if expr is a gcc.ComponentRef for a bitfield."
-    if not isinstance(expr, gcc.ComponentRef):
+    if not isinstance(expr, (gcc.ComponentRef, gcc.BitFieldRef)):
         return False
     if not isinstance(expr.type, gcc.IntegerType):
         return False
-    if expr.bitoffset % 8 != 0:
+    if isinstance(expr, gcc.BitFieldRef):
+        bitoffset = expr.position.constant & 7
+    else:
+        bitoffset = expr.bitoffset
+    if bitoffset != 0:
         return True
     # If a bit field with a size that is a multiple of a byte, and the field
     # is byte aligned, then we can treat it as a normal load/store.
@@ -1369,8 +1379,6 @@ def build_smt_addr(expr, smt_bb, object_size=None):
         decl = expr.target
         offset = BitVecVal(expr.offset, 64)
     elif isinstance(expr, gcc.BitFieldRef):
-        if expr.position.constant % 8 != 0:
-            raise NotImplementedError(f"build_smt_addr {expr.__class__}")
         decl = expr.operand
         offset = BitVecVal(expr.position.constant // 8, 64)
     else:
