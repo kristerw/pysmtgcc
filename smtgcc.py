@@ -105,6 +105,7 @@ class SmtFunction:
 
         # Function return
         self.retval = None
+        self.retval_is_valid = None
         self.invokes_ub = None
         self.memory = None
         self.mem_sizes = None
@@ -1941,6 +1942,7 @@ def process_function(fun, state, reuse):
 
     if not isinstance(fun.decl.result.type, gcc.VoidType):
         results = []
+        validity = []
         for edge in fun.cfg.exit.preds:
             src_smt_bb = smt_fun.bb2smt[edge.src]
             if src_smt_bb.retval is None:
@@ -1952,11 +1954,15 @@ def process_function(fun, state, reuse):
                     retval_sort = get_smt_sort(fun.decl.result.type)
                     state.retval = Const(".retval", retval_sort)
                 retval = state.retval
+                retval_is_valid = BoolVal(False)
             else:
                 retval = src_smt_bb.retval
+                retval_is_valid = BoolVal(True)
             results.append((retval, edge))
+            validity.append((retval_is_valid, edge))
         if results:
             smt_fun.retval = process_phi_smt_args(results, smt_fun)
+            smt_fun.retval_is_valid = process_phi_smt_args(validity, smt_fun)
     exit_smt_bb = smt_fun.bb2smt[fun.cfg.exit]
     smt_fun.memory = exit_smt_bb.memory
     smt_fun.mem_sizes = exit_smt_bb.mem_sizes
@@ -2019,6 +2025,8 @@ def check(
 
     src_retval = src_smt_fun.retval
     tgt_retval = tgt_smt_fun.retval
+    src_valid = src_smt_fun.retval_is_valid
+    tgt_valid = tgt_smt_fun.retval_is_valid
 
     # We check the return value before we check if tgt has more UB than src.
     # This is conceptually wrong, but it does not matter for correctness,
@@ -2031,7 +2039,7 @@ def check(
     success = True
     if src_retval is not None:
         solver = init_solver(src_smt_fun)
-        solver.append(src_retval != tgt_retval)
+        solver.append(And(src_valid, Or(src_retval != tgt_retval, Not(tgt_valid))))
         timeout, model = show_solver_result(
             solver, transform_name, "retval", location, verbose
         )
