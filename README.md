@@ -111,7 +111,6 @@ Some of the major limitations in the current version:
 * Function calls are not implemented.
 * Loops are not implemented.
 * Support for memory operations is a bit shaky:
-  * It is confused about what memory can be pointed to by global pointers.
   * `malloc` etc. are not supported.
   * The tool often reports spurious memory-related errors unless `-fno-strict-aliasing` is passed to the compiler.
   * Pointer size/memory order is hardcoded as 64 bits/little-endian.
