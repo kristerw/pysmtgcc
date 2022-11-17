@@ -78,8 +78,6 @@ class MemoryBlock:
         self.size = size
         self.decl = decl
         self.mem_id = mem_id
-        name = ".mem_" + str(self.mem_id)
-        self.mem_array = Array(name, BitVecSort(PTR_OFFSET_BITS), BitVecSort(8))
 
 
 class SmtPointer:
@@ -305,7 +303,7 @@ def load_value(expr, smt_bb):
         offset = Extract(PTR_OFFSET_BITS - 1, 0, result)
         result = SmtPointer(mem_id, offset)
     elif not isinstance(expr.type, gcc.IntegerType):
-        raise NotImplementedError("load " + str(expr.type.__class__))
+        raise NotImplementedError(f"load {expr.type.__class__}")
 
     return result, is_initialized
 
@@ -416,7 +414,7 @@ def store_value(expr, value, smt_bb):
     elif isinstance(type, gcc.PointerType):
         value = value.bitvector()
     elif not isinstance(type, gcc.IntegerType):
-        raise NotImplementedError("store " + str(type.__class__))
+        raise NotImplementedError(f"store {type.__class__}")
 
     mem_id, offset = build_smt_addr(expr, smt_bb)
     if expr in smt_bb.smt_fun.tree_is_initialized:
@@ -539,7 +537,7 @@ def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
                 and expr.var.is_artificial
                 and expr.var.name[:5] == "CHAIN"
             ):
-                raise NotImplementedError(f"get_tree_as_smt nested functions")
+                raise NotImplementedError("get_tree_as_smt nested functions")
             return smt_bb.smt_fun.tree_to_smt[expr.var]
         if isinstance(expr.var, gcc.VarDecl):
             # We are reading from an uninitialized local variable.
@@ -566,7 +564,7 @@ def get_tree_as_smt(expr, smt_bb, uninit_is_ub=True):
         # Ignore uninit_is_ub as we are doing an operation on the value,
         # which is UB if iti is uninitialized.
         value = get_tree_as_smt(expr.operand, smt_bb, True)
-        return bit_cast(value, expr.operand.type, expr.type, smt_bb)
+        return bit_cast(value, expr.operand.type, expr.type)
     if isinstance(expr, gcc.RealCst):
         return FPVal(expr.constant, get_smt_sort(expr.type))
     if isinstance(expr, gcc.AddrExpr):
@@ -918,7 +916,7 @@ def add_to_offset(offset, val, smt_bb):
     return offset
 
 
-def bit_cast(value, src_type, dest_type, smt_bb):
+def bit_cast(value, src_type, dest_type):
     if isinstance(src_type, gcc.RealType):
         value = fpToIEEEBV(value)
     elif isinstance(src_type, gcc.PointerType):
@@ -1592,7 +1590,7 @@ def init_global_var_decl(decl, mem_id, size, memory, is_initialized):
                         f"init_global_var_decl {elem[0].type.__class__}"
                     )
                 if elem[0].bitoffset % 8 != 0 or elem[0].type.precision % 8 != 0:
-                    raise NotImplementedError(f"init_global_var_decl bitfield")
+                    raise NotImplementedError("init_global_var_decl bitfield")
                 offset = BitVecVal(elem[0].offset, PTR_OFFSET_BITS)
             if isinstance(elem[1].type, gcc.IntegerType):
                 value = BitVecVal(elem[1].constant, elem[1].type.precision)
@@ -2102,7 +2100,6 @@ def check(
 
 
 def find_ub(smt_fun, location, verbose=0):
-    success = True
     if smt_fun.invokes_ub is not None:
         solver = init_solver(smt_fun, False)
         solver.append(smt_fun.invokes_ub)
