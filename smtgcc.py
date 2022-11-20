@@ -109,8 +109,23 @@ class SmtFunction:
         self.mem_sizes = None
         self.is_initialized = None
 
-    def add_ub(self, smt):
-        if self.invokes_ub is None:
+    def add_ub(self, smt_is_executed, smt):
+        if is_true(self.invokes_ub):
+            # This function always invoke UB, so no need to add more
+            # checks.
+            return
+
+        if is_false(smt) or is_false(smt_is_executed):
+            # The basic block cannot invoke UB, so no need to add a
+            # check that always evaluete to false.
+            return
+
+        if is_true(smt):
+            smt = smt_is_executed
+        elif not is_true(smt_is_executed):
+            smt = And(smt_is_executed, smt)
+
+        if self.invokes_ub is None or is_true(smt):
             self.invokes_ub = smt
         else:
             self.invokes_ub = Or(self.invokes_ub, smt)
@@ -171,7 +186,17 @@ class SmtBB:
         return labels
 
     def add_ub(self, smt):
-        if self.invokes_ub is None:
+        if is_true(self.invokes_ub):
+            # This basic block always invoke UB, so no need to add more
+            # checks.
+            return
+
+        if is_false(smt):
+            # This does not invoke UB, so no need to add a
+            # check that always evaluete to false.
+            return
+
+        if self.invokes_ub is None or is_true(smt):
             self.invokes_ub = smt
         else:
             self.invokes_ub = Or(self.invokes_ub, smt)
@@ -345,12 +370,7 @@ def out_of_bound_ub_check(mem_id, offset, size, smt_bb):
     is_valid_mem_id = UGE(mem_id, smt_bb.smt_fun.state.next_id)
     if is_bv_value(mem_id):
         is_valid_mem_id = simplify(is_valid_mem_id)
-        if is_true(is_valid_mem_id):
-            smt_bb.add_ub(is_valid_mem_id)
-        else:
-            assert is_false(is_valid_mem_id)
-    else:
-        smt_bb.add_ub(is_valid_mem_id)
+    smt_bb.add_ub(is_valid_mem_id)
 
     smt_size = Select(smt_bb.mem_sizes, mem_id)
     if is_bv_value(mem_id):
@@ -358,12 +378,7 @@ def out_of_bound_ub_check(mem_id, offset, size, smt_bb):
     is_out_of_bound = Or(UGT(offset + size, smt_size), UGE(offset, offset + size))
     if is_bv_value(smt_size) and is_bv_value(offset):
         is_out_of_bound = simplify(is_out_of_bound)
-        if is_true(is_out_of_bound):
-            smt_bb.add_ub(is_out_of_bound)
-        else:
-            assert is_false(is_out_of_bound)
-    else:
-        smt_bb.add_ub(is_out_of_bound)
+    smt_bb.add_ub(is_out_of_bound)
 
 
 def const_mem_ub_check(mem_id, smt_bb):
@@ -907,9 +922,10 @@ def add_to_offset(offset, val, smt_bb):
     is_constant = is_bv_value(offset)
     offset = ZeroExt(64 - PTR_OFFSET_BITS, offset)
     offset = offset + val
+    is_ub = UGE(offset, (1 << PTR_OFFSET_BITS))
     if is_constant:
-        offset = simplify(offset)
-    smt_bb.add_ub(UGE(offset, (1 << PTR_OFFSET_BITS)))
+        is_ub = simplify(is_ub)
+    smt_bb.add_ub(is_ub)
     offset = Extract(PTR_OFFSET_BITS - 1, 0, offset)
     if is_constant:
         offset = simplify(offset)
@@ -1960,7 +1976,7 @@ def process_function(fun, state, reuse):
     for bb in fun.cfg.inverted_post_order:
         smt_bb = smt_fun.bb2smt[bb]
         if smt_bb.invokes_ub is not None:
-            smt_fun.add_ub(And(smt_bb.is_executed, smt_bb.invokes_ub))
+            smt_fun.add_ub(smt_bb.is_executed, smt_bb.invokes_ub)
 
     return smt_fun
 
