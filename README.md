@@ -1,9 +1,19 @@
 # pysmtgcc
-See "[GCC Translation Validation](https://kristerw.github.io/2022/09/13/translation-validation/)" for background information of this project. The implementation is described in a series of blog posts:
+This is an experimental implementation of translation validation for GCC (similar to the LLVM [Alive2](https://github.com/AliveToolkit/alive2)). The blog post "[GCC Translation Validation](https://kristerw.github.io/2022/09/13/translation-validation/)" contains some background information, and the implementation is described in a series of blog posts:
 1. [Writing a GCC plugin in Python](https://kristerw.github.io/2022/10/20/gcc-python-plugin/)
 2. [Verifying GCC optimizations using an SMT solver](https://kristerw.github.io/2022/11/01/verifying-optimizations/)
 3. TBD Memory
 4. TBD Control flow
+
+This implementation has been reasonably successful and has uncovered seven bugs in GCC ([106513](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106513),
+[106523](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106523),
+[106744](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106744),
+[106883](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106883),
+[106884](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106884),
+[106990](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106990),
+[108625](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108625)).
+
+I'm currently implementing a new production-quality version in C++ (expected to be release during the first half of 2023), so this experimental implementation will not get any further improvements.
 
 # Installing
 ### gcc-python-plugin
