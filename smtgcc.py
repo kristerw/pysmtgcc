@@ -511,7 +511,7 @@ def store(stmt, smt_bb):
 def has_loop(fun):
     "Does the function contain a loop?"
     seen_bbs = []
-    for bb in fun.cfg.inverted_post_order:
+    for bb in fun.cfg.reverse_post_order:
         seen_bbs.append(bb)
         for succ in bb.succs:
             if succ.dest in seen_bbs:
@@ -1802,7 +1802,7 @@ def find_unimplemented(fun):
     This function is useful to run before doing any other work as
     it takes a long time to generate SMT for large functions, and we
     may spend minutes before finding the first unimplemented stmt."""
-    for bb in fun.cfg.inverted_post_order:
+    for bb in fun.cfg.reverse_post_order:
         for stmt in bb.gimple:
             if isinstance(stmt, gcc.GimpleCall):
                 if stmt.fndecl is None:
@@ -1934,7 +1934,7 @@ def process_function(fun, state, reuse):
     for obj in memory_objects:
         smt_fun.decl_to_id[obj.decl] = BitVecVal(obj.mem_id, PTR_ID_BITS)
 
-    for bb in fun.cfg.inverted_post_order:
+    for bb in fun.cfg.reverse_post_order:
         SmtBB(bb, smt_fun, mem_sizes)
         process_bb(bb, smt_fun)
 
@@ -1973,7 +1973,7 @@ def process_function(fun, state, reuse):
     smt_fun.mem_sizes = exit_smt_bb.mem_sizes
     smt_fun.is_initialized = exit_smt_bb.is_initialized
 
-    for bb in fun.cfg.inverted_post_order:
+    for bb in fun.cfg.reverse_post_order:
         smt_bb = smt_fun.bb2smt[bb]
         if smt_bb.invokes_ub is not None:
             smt_fun.add_ub(smt_bb.is_executed, smt_bb.invokes_ub)
