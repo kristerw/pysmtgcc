@@ -1023,7 +1023,10 @@ def convert_to_float(value, src_type, dest_type):
         fp1 = FPVal(1.0, smt_sort)
         return If(value, fp1, fp0)
     if isinstance(src_type, gcc.IntegerType):
-        return fpToFP(RNE(), value, smt_sort)
+        if src_type.unsigned:
+            return fpToFPUnsigned(RNE(), value, smt_sort)
+        else:
+            return fpToFP(RNE(), value, smt_sort)
 
     raise NotImplementedError(f"convert_to_float {src_type.__class__}")
 
