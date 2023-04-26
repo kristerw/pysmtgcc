@@ -5,13 +5,14 @@ This is an experimental implementation of translation validation for GCC (simila
 3. TBD Memory
 4. TBD Control flow
 
-This implementation has been reasonably successful and has uncovered seven bugs in GCC ([106513](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106513),
+This implementation has been reasonably successful and has uncovered several bugs in GCC ([106513](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106513),
 [106523](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106523),
 [106744](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106744),
 [106883](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106883),
 [106884](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106884),
 [106990](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106990),
-[108625](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108625)).
+[108625](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108625),
+[109626](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109626)).
 
 I'm currently implementing a new production-quality version in C++ (expected to be release during the first half of 2023), so this experimental implementation will not get any further improvements.
 
