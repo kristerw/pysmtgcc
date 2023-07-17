@@ -2,8 +2,12 @@
 This is an experimental implementation of translation validation for GCC (similar to the LLVM [Alive2](https://github.com/AliveToolkit/alive2)). The blog post "[GCC Translation Validation](https://kristerw.github.io/2022/09/13/translation-validation/)" contains some background information, and the implementation is described in a series of blog posts:
 1. [Writing a GCC plugin in Python](https://kristerw.github.io/2022/10/20/gcc-python-plugin/)
 2. [Verifying GCC optimizations using an SMT solver](https://kristerw.github.io/2022/11/01/verifying-optimizations/)
-3. TBD Memory
-4. TBD Control flow
+3. [Memory representation](https://kristerw.github.io/2023/07/17/memory-representation/)
+4. Address calculations
+5. Pointer alignment
+6. Problems with pointers
+7. Uninitialized memory
+8. Control flow
 
 This implementation has been reasonably successful and has uncovered several bugs in GCC ([106513](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106513),
 [106523](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=106523),
