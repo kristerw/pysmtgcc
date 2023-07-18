@@ -3,7 +3,7 @@ This is an experimental implementation of translation validation for GCC (simila
 1. [Writing a GCC plugin in Python](https://kristerw.github.io/2022/10/20/gcc-python-plugin/)
 2. [Verifying GCC optimizations using an SMT solver](https://kristerw.github.io/2022/11/01/verifying-optimizations/)
 3. [Memory representation](https://kristerw.github.io/2023/07/17/memory-representation/)
-4. Address calculations
+4. [Address calculations](https://kristerw.github.io/2023/07/18/address-calculations/)
 5. Pointer alignment
 6. Problems with pointers
 7. Uninitialized memory
