@@ -18,7 +18,7 @@ This implementation has been reasonably successful and has uncovered several bug
 [108625](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=108625),
 [109626](https://gcc.gnu.org/bugzilla/show_bug.cgi?id=109626)).
 
-I'm currently implementing a new production-quality version in C++ (expected to be release during the first half of 2023), so this experimental implementation will not get any further improvements.
+I'm currently implementing a new, much improved, version in C++ ([smtgcc](https://github.com/kristerw/smtgcc)), so this experimental implementation will not get any further improvements.
 
 # Installing
 ### gcc-python-plugin
